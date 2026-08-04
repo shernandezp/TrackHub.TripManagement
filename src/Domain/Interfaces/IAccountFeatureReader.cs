@@ -31,8 +31,10 @@ public interface IAccountFeatureReader
 
     /// <summary>
     /// The feature's <c>ConfigurationJson</c>, which carries this module's per-account settings:
-    /// <c>delayThresholdMinutes</c> (default 15), <c>scheduleLeadMinutes</c> (default 60) and
-    /// <c>tollMatchToleranceMeters</c> (default 100).
+    /// <c>delayThresholdMinutes</c> (15), <c>scheduleLeadMinutes</c> (60),
+    /// <c>tollMatchToleranceMeters</c> (100), <c>activationLeadMinutes</c> (60),
+    /// <c>backfillLookbackHours</c> (24), <c>finalStopCompletionMinutes</c> (30),
+    /// <c>overdueGraceMinutes</c> (120) and <c>autoLifecycle</c> (true).
     /// </summary>
     Task<TripAccountConfigVm> GetAccountConfigAsync(Guid accountId, CancellationToken cancellationToken);
 }
@@ -41,14 +43,42 @@ public interface IAccountFeatureReader
 public readonly record struct TripAccountConfigVm(
     int DelayThresholdMinutes,
     int ScheduleLeadMinutes,
-    double TollMatchToleranceMeters)
+    double TollMatchToleranceMeters,
+    int ActivationLeadMinutes,
+    int BackfillLookbackHours,
+    int FinalStopCompletionMinutes,
+    int OverdueGraceMinutes,
+    bool AutoLifecycle)
 {
     public const int DefaultDelayThresholdMinutes = 15;
     public const int DefaultScheduleLeadMinutes = 60;
     public const double DefaultTollMatchToleranceMeters = 100d;
 
+    /// <summary>How long before <c>PlannedStartAt</c> a trip becomes armable (spec 11a §8).</summary>
+    public const int DefaultActivationLeadMinutes = 60;
+
+    /// <summary>How far back a late-created trip searches Geofencing's visit history (§5.4).</summary>
+    public const int DefaultBackfillLookbackHours = 24;
+
+    /// <summary>Dwell at an <c>Arrived</c> final stop before dwell-based completion (§5.2).</summary>
+    public const int DefaultFinalStopCompletionMinutes = 30;
+
+    /// <summary>How long past the planned start before the board phase reads Overdue (§7).</summary>
+    public const int DefaultOverdueGraceMinutes = 120;
+
+    /// <summary>
+    /// Account-level kill switch for the zero-touch lifecycle. Defaults ON — that is the mandate —
+    /// and a fleet without reliable GPS turns it off to run the manual flow exactly as before.
+    /// </summary>
+    public const bool DefaultAutoLifecycle = true;
+
     public static TripAccountConfigVm Default => new(
         DefaultDelayThresholdMinutes,
         DefaultScheduleLeadMinutes,
-        DefaultTollMatchToleranceMeters);
+        DefaultTollMatchToleranceMeters,
+        DefaultActivationLeadMinutes,
+        DefaultBackfillLookbackHours,
+        DefaultFinalStopCompletionMinutes,
+        DefaultOverdueGraceMinutes,
+        DefaultAutoLifecycle);
 }

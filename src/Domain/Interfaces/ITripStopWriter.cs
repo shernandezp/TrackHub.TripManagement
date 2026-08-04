@@ -29,6 +29,17 @@ public interface ITripStopWriter
     Task RemoveStopAsync(Guid tripStopId, Guid accountId, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Replaces a trip's whole route in one go — the re-plan a partner's weekly re-upload performs
+    /// (spec 11a §9.2).
+    /// <para>
+    /// Permitted only while the trip is still <c>Created</c>. A running trip's stops carry
+    /// measurements and deliveries, so replacing them would erase recorded history; the caller must
+    /// reject that case before reaching here, and this method enforces it too.
+    /// </para>
+    /// </summary>
+    Task ReplaceStopsAsync(Guid tripId, Guid accountId, IReadOnlyCollection<TripStopDto> stops, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Re-sequences a trip's stops. A completed stop may not be pushed below an uncompleted one,
     /// so a reorder can never rewrite history.
     /// </summary>

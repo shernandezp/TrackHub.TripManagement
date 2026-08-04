@@ -36,7 +36,6 @@ public readonly record struct TripStatusUpdateItem(string ExternalReference, str
 public sealed class UpdateTripStatusCommandHandler(
     ITripWriter writer,
     ITripReader reader,
-    ITripEventWriter tripEventWriter,
     ILogger<UpdateTripStatusCommandHandler> logger) : IRequestHandler<UpdateTripStatusCommand, IReadOnlyCollection<TripImportResultVm>>
 {
     public async Task<IReadOnlyCollection<TripImportResultVm>> Handle(UpdateTripStatusCommand request, CancellationToken cancellationToken)
@@ -68,12 +67,21 @@ public sealed class UpdateTripStatusCommandHandler(
         if (!TripStatuses.CanTransition(current.Status, update.Status))
             return new TripImportResultVm(update.ExternalReference, false, current.TripId, TripErrorCodes.InvalidTransition, $"{current.Status} cannot transition to {update.Status}.");
 
-        await writer.TransitionTripAsync(current.TripId, accountId, update.Status, update.Reason, force: false, cancellationToken);
-
-        await tripEventWriter.AppendAsync(
-            accountId, current.TripId, null, $"Trip{update.Status}", DateTimeOffset.UtcNow,
-            TripEventSources.ServiceClient, null,
-            $"trip-external-{update.Status.ToLowerInvariant()}:{current.TripId:N}", cancellationToken);
+        // One funnel call: the status change and its timeline event commit together, and the event
+        // type is derived from the transition rather than string-built — `Trip{Status}` produced
+        // "TripInProgress", a type no catalog on either side of the wire has ever known.
+        await writer.TransitionTripAsync(
+            current.TripId,
+            accountId,
+            update.Status,
+            TripEventTypes.ForTransition(current.Status, update.Status),
+            TripEventSources.ServiceClient,
+            $"trip-external-{update.Status.ToLowerInvariant()}:{current.TripId:N}",
+            null,
+            update.Reason,
+            force: false,
+            measuredAt: null,
+            cancellationToken);
 
         return new TripImportResultVm(update.ExternalReference, true, current.TripId, null, null);
     }

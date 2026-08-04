@@ -69,6 +69,7 @@ public sealed class PublicTripSnapshotDisclosureTests
     private static ApplicationDbContext NewContext()
         => new(new DbContextOptionsBuilder<ApplicationDbContext>()
             .UseInMemoryDatabase($"trip-disclosure-{Guid.NewGuid()}")
+            .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking)
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options);
 

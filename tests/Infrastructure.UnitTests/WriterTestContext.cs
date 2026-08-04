@@ -31,6 +31,17 @@ namespace Infrastructure.UnitTests;
 /// genuine event later in the same request was lost. Only a test that keeps saving on the same
 /// context after the violation can see that.
 /// </para>
+/// <para>
+/// <b>It runs <see cref="QueryTrackingBehavior.NoTracking"/>, because production does</b>
+/// (<c>TripDB/DependencyInjection.cs</c>). Without that line here the writers were exercised under
+/// <c>TrackAll</c>, where a query returns the instance the change tracker already holds and
+/// <c>Attach</c> is a harmless no-op. Under the deployed behaviour the query returns a SECOND
+/// instance and the attach throws — so every multi-write request (the whole position-detection
+/// pipeline, the backfill, both importers, the ETA sweep) failed on its second write while 334
+/// tests stayed green. A harness that does not match the registration proves nothing about the
+/// code that ships; this is the same class of divergence as the EF-InMemory <c>OrderBy</c> trap in
+/// rules.md.
+/// </para>
 /// </summary>
 internal sealed class WriterTestContext(DbContextOptions<ApplicationDbContext> options) : ApplicationDbContext(options)
 {
@@ -40,6 +51,7 @@ internal sealed class WriterTestContext(DbContextOptions<ApplicationDbContext> o
     internal static WriterTestContext Create()
         => new(new DbContextOptionsBuilder<ApplicationDbContext>()
             .UseInMemoryDatabase($"trip-writers-{Guid.NewGuid()}")
+            .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking)
             .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning))
             .Options);
 

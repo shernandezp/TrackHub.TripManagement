@@ -22,6 +22,12 @@ namespace TrackHub.TripManagement.Infrastructure.TripDB.Writers;
 /// <summary>
 /// Stop mutation. Sequences are re-normalized server-side on every structural change, so the
 /// unique <c>(TripId, Sequence)</c> index can never be violated by a client's ordering.
+/// <para>
+/// Queries that lead to a mutation are <c>AsTracking()</c> and nothing here calls <c>Attach</c> —
+/// see <see cref="TripWriter"/> for why. The paths that hit it here are the ETA sweep (an ETA
+/// update followed by the delay stamp on the SAME stop), detection across a multi-fix batch, and
+/// the partner importer (a header update followed by a stop replacement on the same trip).
+/// </para>
 /// </summary>
 public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWriter
 {
@@ -50,7 +56,12 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
             City = stop.City,
             Point = TripGeometryFactory.Point(stop.Latitude, stop.Longitude),
             GeofenceId = stop.GeofenceId,
-            ArrivalRadiusMeters = stop.ArrivalRadiusMeters,
+
+            // Normalized, not taken raw: the portal path is already validated to 50-5000, but
+            // ImportTripsValidator checks only trip-level fields, so a partner sending 0 (or
+            // nothing) would otherwise get a zero-radius arrival ring that can never contain a fix.
+            ArrivalRadiusMeters = TripGeometry.NormalizeRadius(stop.ArrivalRadiusMeters),
+            Activity = TripStopActivities.Normalize(stop.Activity),
             PlannedArrivalFrom = stop.PlannedArrivalFrom,
             PlannedArrivalTo = stop.PlannedArrivalTo,
             Status = TripStopStatuses.Pending,
@@ -60,11 +71,13 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
             Observations = stop.Observations,
         };
 
-        // A stop added to an already-started trip gets its arrival snapshot immediately -
-        // otherwise detection would never fire for it (the trip-start snapshot has passed).
-        // Paused counts: Resume does not re-snapshot, so a stop added while paused would stay
-        // null-geometry for the rest of the trip.
-        if (TripStatuses.HasStarted(trip.Status))
+        // A stop added to a trip detection is already WATCHING gets its arrival snapshot
+        // immediately - otherwise detection would never fire for it (the bulk snapshot has passed).
+        //
+        // "Watching" is armed OR started, not just started. Paused counts because Resume does not
+        // re-snapshot; ARMED counts because arming now takes the bulk snapshot for a Created trip,
+        // and a stop added afterwards would otherwise be the one stop on the route with no geometry.
+        if (IsWatched(trip))
         {
             entity.ArrivalGeom = await ResolveArrivalGeomAsync(entity, accountId, cancellationToken);
         }
@@ -85,14 +98,13 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
             throw ConflictException.WithCode(TripErrorCodes.StopAlreadyDeparted);
         }
 
-        context.TripStops.Attach(entity);
-
         entity.Name = stop.Name;
         entity.Address = stop.Address;
         entity.City = stop.City;
         entity.Point = TripGeometryFactory.Point(stop.Latitude, stop.Longitude);
         entity.GeofenceId = stop.GeofenceId;
-        entity.ArrivalRadiusMeters = stop.ArrivalRadiusMeters;
+        entity.ArrivalRadiusMeters = TripGeometry.NormalizeRadius(stop.ArrivalRadiusMeters);
+        entity.Activity = TripStopActivities.Normalize(stop.Activity);
         entity.PlannedArrivalFrom = stop.PlannedArrivalFrom;
         entity.PlannedArrivalTo = stop.PlannedArrivalTo;
         entity.RequiresPod = stop.RequiresPod;
@@ -102,18 +114,22 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
         // Re-snapshot only while the snapshot is still live for this stop; a stop already Arrived
         // keeps the geometry its arrival was judged against.
         //
-        // Keyed on the TRIP having started, not on ArrivalGeom already being non-null. The old
+        // Keyed on the TRIP being watched, not on ArrivalGeom already being non-null. The old
         // condition could only ever refresh a geometry that existed, so a stop left null-geometry
         // (see AddStopAsync) stayed undetectable no matter how many times it was edited — editing
         // was the one obvious way a dispatcher would have tried to fix it.
+        //
+        // ARMED counts as watched: a Created trip carries a snapshot from arming now, and the
+        // start-time fill only touches NULL geometries — so moving a stop on an armed trip would
+        // otherwise leave detection judging arrivals against the place the stop used to be.
         if (string.Equals(entity.Status, TripStopStatuses.Pending, StringComparison.Ordinal))
         {
-            var tripStarted = await context.Trips
+            var watched = await context.Trips
                 .Where(t => t.TripId == entity.TripId && t.AccountId == accountId)
-                .Select(t => t.Status)
-                .FirstOrDefaultAsync(cancellationToken) is { } status && TripStatuses.HasStarted(status);
+                .Select(t => new { t.Status, t.ArmedAt })
+                .FirstOrDefaultAsync(cancellationToken);
 
-            if (tripStarted)
+            if (watched is not null && (TripStatuses.HasStarted(watched.Status) || watched.ArmedAt.HasValue))
             {
                 entity.ArrivalGeom = await ResolveArrivalGeomAsync(entity, accountId, cancellationToken);
             }
@@ -134,16 +150,81 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
         }
 
         var tripId = entity.TripId;
-        context.TripStops.Attach(entity);
         context.TripStops.Remove(entity);
         await context.SaveChangesAsync(cancellationToken);
 
         await RenumberAsync(tripId, cancellationToken);
     }
 
+    public async Task ReplaceStopsAsync(Guid tripId, Guid accountId, IReadOnlyCollection<TripStopDto> stops, CancellationToken cancellationToken)
+    {
+        // Tracking: this path stamps a domain event on the trip, and the partner importer reaches it
+        // straight after UpdateTripAsync has already tracked the same row.
+        var trip = await context.Trips.AsTracking().FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken)
+            ?? throw new NotFoundException($"{tripId}", nameof(Trip));
+
+        // A started trip's stops are recorded history — arrivals, departures, deliveries, POD.
+        // Replacing them would delete measurements, so the route is only replaceable while the trip
+        // is still a plan.
+        if (!string.Equals(trip.Status, TripStatuses.Created, StringComparison.Ordinal))
+        {
+            throw ConflictException.WithCode(TripErrorCodes.TripNotActive);
+        }
+
+        var existing = await context.TripStops
+            .AsTracking()
+            .Where(s => s.TripId == tripId && s.AccountId == accountId)
+            .ToListAsync(cancellationToken);
+
+        foreach (var stop in existing)
+        {
+            context.TripStops.Remove(stop);
+        }
+
+        // The old route is deleted in a save of its OWN, before the new one is inserted. Batching
+        // both would hand the database a delete of (trip, 1) and an insert of (trip, 1) in one
+        // command batch, and `ux_trip_stops_tripid_sequence` is checked per statement — the same
+        // hazard `ReorderStopsAsync` avoids with its negative-range two-pass.
+        if (existing.Count > 0)
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
+
+        var sequence = 1;
+        foreach (var stop in stops)
+        {
+            await context.TripStops.AddAsync(
+                new TripStop
+                {
+                    AccountId = accountId,
+                    TripId = tripId,
+                    Sequence = sequence++,
+                    Name = stop.Name,
+                    Address = stop.Address,
+                    City = stop.City,
+                    Point = TripGeometryFactory.Point(stop.Latitude, stop.Longitude),
+                    GeofenceId = stop.GeofenceId,
+                    ArrivalRadiusMeters = TripGeometry.NormalizeRadius(stop.ArrivalRadiusMeters),
+                    Activity = TripStopActivities.Normalize(stop.Activity),
+                    PlannedArrivalFrom = stop.PlannedArrivalFrom,
+                    PlannedArrivalTo = stop.PlannedArrivalTo,
+                    Status = TripStopStatuses.Pending,
+                    EtaSource = EtaSources.Unavailable,
+                    RequiresPod = stop.RequiresPod,
+                    Priority = stop.Priority,
+                    Observations = stop.Observations,
+                },
+                cancellationToken);
+        }
+
+        trip.AddDomainEvent(new TripDomainEvent(TripEventTypes.TripUpdated, accountId, tripId));
+        await context.SaveChangesAsync(cancellationToken);
+    }
+
     public async Task ReorderStopsAsync(Guid tripId, Guid accountId, IReadOnlyCollection<Guid> orderedStopIds, CancellationToken cancellationToken)
     {
         var stops = await context.TripStops
+            .AsTracking()
             .Where(s => s.TripId == tripId && s.AccountId == accountId)
             .OrderBy(s => s.Sequence)
             .ToListAsync(cancellationToken);
@@ -186,7 +267,6 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
         for (var i = 0; i < ordered.Count; i++)
         {
             var stop = stops.Find(s => s.TripStopId == ordered[i])!;
-            context.TripStops.Attach(stop);
             stop.Sequence = -(i + 1);
         }
 
@@ -244,8 +324,6 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
             Source = source,
             IdempotencyKey = idempotencyKey,
         };
-
-        context.TripStops.Attach(entity);
 
         // Timestamps once written are NEVER overwritten by a later detection or manual override
         // (acceptance 12). The status still advances; only the first recorded instant survives.
@@ -305,6 +383,7 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
     public async Task SetStopOutsideSinceAsync(Guid tripStopId, Guid accountId, DateTimeOffset? outsideSinceAt, CancellationToken cancellationToken)
     {
         var entity = await context.TripStops
+            .AsTracking()
             .FirstOrDefaultAsync(s => s.TripStopId == tripStopId && s.AccountId == accountId, cancellationToken);
 
         if (entity is null || entity.OutsideSinceAt == outsideSinceAt)
@@ -312,7 +391,6 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
             return;
         }
 
-        context.TripStops.Attach(entity);
         entity.OutsideSinceAt = outsideSinceAt;
         await context.SaveChangesAsync(cancellationToken);
     }
@@ -320,7 +398,6 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
     public async Task UpdateStopEtaAsync(Guid tripStopId, Guid accountId, DateTimeOffset? etaAt, string etaSource, CancellationToken cancellationToken)
     {
         var entity = await FindAsync(tripStopId, accountId, null, cancellationToken);
-        context.TripStops.Attach(entity);
         entity.EtaAt = etaAt;
         entity.EtaSource = etaSource;
         await context.SaveChangesAsync(cancellationToken);
@@ -329,7 +406,6 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
     public async Task MarkStopDelayAlertedAsync(Guid tripStopId, Guid accountId, DateTimeOffset alertedAt, CancellationToken cancellationToken)
     {
         var entity = await FindAsync(tripStopId, accountId, null, cancellationToken);
-        context.TripStops.Attach(entity);
 
         // One-shot marker, stamped only AFTER the alert was successfully emitted (the geofence
         // dwell precedent) so a failed emission is retried rather than lost.
@@ -344,6 +420,13 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
         TripStopStatuses.Skipped => TripEventTypes.TripStopSkipped,
         _ => TripEventTypes.TripUpdated,
     };
+
+    /// <summary>
+    /// Whether detection is already judging this trip's stops against frozen geometry — armed, or
+    /// running/paused. A stop touched while the trip is watched must carry a snapshot of its own.
+    /// </summary>
+    private static bool IsWatched(Trip trip)
+        => TripStatuses.HasStarted(trip.Status) || trip.ArmedAt.HasValue;
 
     private async Task<NetTopologySuite.Geometries.Polygon> ResolveArrivalGeomAsync(TripStop stop, Guid accountId, CancellationToken cancellationToken)
     {
@@ -366,6 +449,7 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
     private async Task RenumberAsync(Guid tripId, CancellationToken cancellationToken)
     {
         var stops = await context.TripStops
+            .AsTracking()
             .Where(s => s.TripId == tripId)
             .OrderBy(s => s.Sequence)
             .ToListAsync(cancellationToken);
@@ -376,7 +460,6 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
         {
             if (stop.Sequence != next)
             {
-                context.TripStops.Attach(stop);
                 stop.Sequence = next;
                 changed = true;
             }
@@ -431,7 +514,7 @@ public sealed class TripStopWriter(IApplicationDbContext context) : ITripStopWri
     }
 
     private async Task<TripStop> FindAsync(Guid tripStopId, Guid accountId, Guid? tripId, CancellationToken cancellationToken)
-        => await context.TripStops.FirstOrDefaultAsync(
+        => await context.TripStops.AsTracking().FirstOrDefaultAsync(
                 s => s.TripStopId == tripStopId
                     && s.AccountId == accountId
                     && (tripId == null || s.TripId == tripId),

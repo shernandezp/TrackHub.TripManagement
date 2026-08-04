@@ -48,7 +48,11 @@ internal static class TestFactory
 
     public static ILogger<T> Logger<T>() => NullLogger<T>.Instance;
 
-    public static TripVm Trip(string status = TripStatuses.InProgress, Guid? tripId = null)
+    public static TripVm Trip(
+        string status = TripStatuses.InProgress,
+        Guid? tripId = null,
+        Guid? originGeofenceId = null,
+        DateTimeOffset? actualStartAt = null)
         => new(
             tripId ?? TripId,
             AccountId,
@@ -63,10 +67,20 @@ internal static class TestFactory
             "Depot",
             4.65,
             -74.05,
+            originGeofenceId,
+            TripGeometry.DefaultRadiusMeters,
             DateTimeOffset.UtcNow,
             null,
+            actualStartAt,
             null,
             null,
+            null,
+            null,
+            TripPhases.Scheduled,
+            null,
+            null,
+            null,
+            false,
             null,
             null,
             null,
@@ -75,6 +89,7 @@ internal static class TestFactory
             "II",
             null,
             null,
+            2,
             2,
             DateTimeOffset.UtcNow);
 
@@ -92,6 +107,7 @@ internal static class TestFactory
             -74.0,
             null,
             150,
+            TripStopActivities.Unload,
             null,
             null,
             status,
@@ -108,6 +124,10 @@ internal static class TestFactory
     // lastLatitude/lastLongitude are the PERSISTED Trip.LastPoint the detection reader projects.
     // They are what makes the odometer accumulate across calls: Router delivers one fix per call,
     // so the previous point can only come from the row, never from per-request memory.
+    // The status/origin arguments are what widened with zero-touch: a watched trip may be a Created
+    // one waiting at the gate or an InProgress one on the road, and every automatic step is gated on
+    // which. Defaults describe a running trip that has already left its origin, so the tests written
+    // before zero-touch keep describing exactly the scenario they always did.
     public static OpenTripVm OpenTrip(
         IReadOnlyCollection<OpenTripStopVm> stops,
         bool hasReadyPlan = false,
@@ -116,15 +136,29 @@ internal static class TestFactory
         double actualDistanceMeters = 0d,
         double? lastLatitude = null,
         double? lastLongitude = null,
-        DateTimeOffset? lastPositionAt = null)
+        DateTimeOffset? lastPositionAt = null,
+        string status = TripStatuses.InProgress,
+        DateTimeOffset? plannedStartAt = null,
+        DateTimeOffset? armedAt = null,
+        bool hasOriginGeom = false,
+        DateTimeOffset? originArrivedAt = null,
+        DateTimeOffset? originDepartedAt = null,
+        DateTimeOffset? originOutsideSinceAt = null)
         => new(
             TripId,
             AccountId,
             "TRIP-001",
+            status,
             TransporterId,
             null,
             hasReadyPlan ? RoutePlanId : null,
             hasReadyPlan,
+            plannedStartAt ?? DateTimeOffset.UtcNow,
+            armedAt,
+            hasOriginGeom,
+            originArrivedAt,
+            originDepartedAt,
+            originOutsideSinceAt,
             deviationOpenedAt,
             consecutiveOutsideFixes,
             actualDistanceMeters,

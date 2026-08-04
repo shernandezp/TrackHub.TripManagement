@@ -34,6 +34,8 @@ public partial class ApplicationDbContext(DbContextOptions<ApplicationDbContext>
     public DbSet<TollStation> TollStations { get; set; }
     public DbSet<TollTariff> TollTariffs { get; set; }
     public DbSet<Geofence> Geofences { get; set; }
+    public DbSet<GeofenceVisit> GeofenceVisits { get; set; }
+    public DbSet<PointOfInterest> PointsOfInterest { get; set; }
     public DbSet<Transporter> Transporters { get; set; }
     public DbSet<Driver> Drivers { get; set; }
     public DbSet<VwVisibleTransporter> VisibleTransporters { get; set; }

@@ -43,6 +43,11 @@ public static class DependencyInjection
         services.AddScoped<ITollEstimationService, TollEstimationService>();
         services.AddScoped<ITripEtaService, TripEtaService>();
 
+        // Shared by the detection pipeline and the trip-eta-refresh sweep: one implementation of
+        // "is this trip finished?", so the two callers can never disagree (spec 11a §5.2).
+        services.AddScoped<ITripAutoCompletionService, TripAutoCompletionService>();
+        services.AddScoped<ITripStartBackfillService, TripStartBackfillService>();
+
         // Resolved directly by the anonymous public-tracking endpoint, which bypasses the mediator.
         services.AddScoped<IPublicTripResolver, PublicTripResolver>();
 

@@ -17,27 +17,24 @@ namespace TrackHub.TripManagement.Domain.Interfaces;
 
 /// <summary>
 /// The detection working set. Unlike Geofencing — which must consider an account's whole zone
-/// catalog — trip detection only ever looks at <c>InProgress</c> trips, which is why arrival
-/// belongs here rather than to the general-purpose zone engine (spec 11 §18.4).
+/// catalog — trip detection looks at a small, bounded set: the account's <c>InProgress</c> trips
+/// plus at most one armable <c>Created</c> trip per transporter (spec 11a §6.1). That is what makes
+/// arrival belong here rather than to the general-purpose zone engine (spec 11 §18.4).
 /// </summary>
 public interface ITripDetectionReader
 {
     /// <summary>
-    /// Open trips for the given transporters, with their pending/arrived stops and the plan
-    /// corridor, in one round trip. Geometry containment is evaluated in the database.
+    /// <c>InProgress</c> trips whose route has no <c>Pending</c> stop left — the only trips
+    /// auto-completion could possibly act on. A cheap pre-filter for the fallback sweep, so the
+    /// hosted loop does not re-examine every running trip every cycle.
     /// </summary>
-    Task<IReadOnlyCollection<OpenTripVm>> GetOpenTripsAsync(
-        Guid accountId,
-        IReadOnlyCollection<Guid> transporterIds,
-        CancellationToken cancellationToken);
+    Task<IReadOnlyCollection<Guid>> GetCompletionCandidatesAsync(Guid accountId, CancellationToken cancellationToken);
 
-    /// <summary>True when the point falls inside the stop's snapshotted arrival geometry.</summary>
-    Task<IReadOnlyCollection<Guid>> GetStopsContainingPointAsync(
-        Guid accountId,
-        Guid tripId,
-        double latitude,
-        double longitude,
-        CancellationToken cancellationToken);
+    /// <summary>
+    /// The trip's stops in sequence order with just what completion needs, plus the identity fields
+    /// the <c>TripCompleted</c> alert carries.
+    /// </summary>
+    Task<TripCompletionCandidateVm?> GetCompletionStateAsync(Guid accountId, Guid tripId, CancellationToken cancellationToken);
 
     /// <summary>
     /// True inside the plan's corridor polygon, false outside — and <b>null when the question
@@ -73,15 +70,31 @@ public interface ITripDetectionReader
     Task<IReadOnlyCollection<TripVm>> GetTripsDueToStartAsync(Guid accountId, DateTimeOffset dueAfter, DateTimeOffset dueBefore, CancellationToken cancellationToken);
 }
 
-/// <summary>An in-flight trip plus the stops detection may still act on.</summary>
+/// <summary>
+/// A watched trip plus its stops. "Watched" now spans two statuses — a <c>Created</c> trip that is
+/// armable and an <c>InProgress</c> one — so <see cref="Status"/> is carried and every automatic
+/// step is gated on it.
+/// </summary>
+/// <param name="HasOriginGeom">
+/// Whether the origin snapshot exists. Without it there is nothing to auto-start from — which is
+/// exactly how trips created before zero-touch stay inert (§14).
+/// </param>
+/// <param name="OriginOutsideSinceAt">The persisted origin exit-debounce clock; null while inside.</param>
 public readonly record struct OpenTripVm(
     Guid TripId,
     Guid AccountId,
     string Code,
+    string Status,
     Guid TransporterId,
     Guid? DriverId,
     Guid? RoutePlanId,
     bool HasReadyRoutePlan,
+    DateTimeOffset PlannedStartAt,
+    DateTimeOffset? ArmedAt,
+    bool HasOriginGeom,
+    DateTimeOffset? OriginArrivedAt,
+    DateTimeOffset? OriginDepartedAt,
+    DateTimeOffset? OriginOutsideSinceAt,
     DateTimeOffset? DeviationOpenedAt,
     int ConsecutiveOutsideFixes,
     double ActualDistanceMeters,
@@ -103,6 +116,31 @@ public readonly record struct OpenTripStopVm(
     DateTimeOffset? OutsideSinceAt,
     double Latitude,
     double Longitude);
+
+/// <summary>
+/// What auto-completion needs to decide whether a trip is finished: the stops in sequence order,
+/// and the identity fields the <c>TripCompleted</c> alert carries.
+/// </summary>
+public readonly record struct TripCompletionCandidateVm(
+    Guid TripId,
+    string Code,
+    string Status,
+    Guid TransporterId,
+    Guid? DriverId,
+    IReadOnlyCollection<CompletionStopVm> Stops);
+
+public readonly record struct CompletionStopVm(
+    Guid TripStopId,
+    int Sequence,
+    string Status,
+    DateTimeOffset? ActualArrivalAt,
+    DateTimeOffset? ActualDepartureAt,
+
+    // The persisted exit-debounce clock. Dwell-based completion means "the vehicle parked here and
+    // is never going to depart", and that claim is false while this is set — we are holding
+    // positive evidence it is already outside the zone. Without it the completion rule could not
+    // see the departure it was racing.
+    DateTimeOffset? OutsideSinceAt);
 
 /// <summary>
 /// A trip whose next pending stop needs an ETA recomputed.

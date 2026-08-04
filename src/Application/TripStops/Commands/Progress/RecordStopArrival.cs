@@ -16,6 +16,7 @@
 using Common.Application.Interfaces;
 using Microsoft.Extensions.Logging;
 using TrackHub.TripManagement.Application.Common;
+using TrackHub.TripManagement.Application.Trips.Services.Interfaces;
 
 namespace TrackHub.TripManagement.Application.TripStops.Commands.Progress;
 
@@ -45,8 +46,11 @@ public readonly record struct RecordStopArrivalCommand(
 
 public sealed class RecordStopArrivalCommandHandler(
     ITripStopWriter stopWriter,
+    ITripEventWriter tripEventWriter,
     ITripReader reader,
     IAlertEmitter alertEmitter,
+    ITripAutoCompletionService autoCompletion,
+    IAccountFeatureReader accountFeatureReader,
     IUserReader userReader,
     IUser user,
     ILogger<RecordStopArrivalCommandHandler> logger) : IRequestHandler<RecordStopArrivalCommand, bool>
@@ -57,7 +61,7 @@ public sealed class RecordStopArrivalCommandHandler(
     {
         var caller = await userReader.GetUserAsync(UserId, cancellationToken);
         return await TripStopProgress.ExecuteAsync(
-            reader, stopWriter, alertEmitter, logger,
+            reader, stopWriter, tripEventWriter, alertEmitter, autoCompletion, accountFeatureReader, logger,
             request.TripId, request.TripStopId, caller.AccountId, TripVisibility.ResolveScopeUserId(user, UserId),
             TripStopStatuses.Arrived, TripEventTypes.TripStopArrived, TripAlertSeverities.Info,
             request.OccurredAt, request.Latitude, request.Longitude,

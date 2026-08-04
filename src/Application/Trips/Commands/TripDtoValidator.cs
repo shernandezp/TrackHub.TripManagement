@@ -27,6 +27,8 @@ public sealed class TripDtoValidator : AbstractValidator<TripDto>
         RuleFor(v => v.OriginName).NotEmpty().MaximumLength(200);
         RuleFor(v => v.OriginLatitude).InclusiveBetween(-90d, 90d);
         RuleFor(v => v.OriginLongitude).InclusiveBetween(-180d, 180d);
+        RuleFor(v => v.OriginRadiusMeters)
+            .InclusiveBetween(TripGeometry.MinRadiusMeters, TripGeometry.MaxRadiusMeters);
         RuleFor(v => v.Notes).MaximumLength(2000);
         RuleFor(v => v.TollVehicleClass).MaximumLength(20);
         RuleFor(v => v.PlannedStartAt).NotEqual(default(DateTimeOffset));

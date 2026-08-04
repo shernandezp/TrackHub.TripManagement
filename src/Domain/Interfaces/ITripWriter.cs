@@ -30,38 +30,60 @@ public interface ITripWriter
 
     /// <summary>
     /// Applies a lifecycle transition after validating it against the matrix, stamping
-    /// <c>ActualStartAt</c>/<c>ActualEndAt</c> and — on Start — snapshotting each stop's
-    /// <c>ArrivalGeom</c> so a mid-flight geofence edit cannot move a running trip's geometry.
+    /// <c>ActualStartAt</c>/<c>ActualEndAt</c> and appending the timeline event — <b>all in one
+    /// save</b>.
+    /// <para>
+    /// Returns <c>false</c> when the transition was ALREADY recorded under
+    /// <paramref name="idempotencyKey"/>: nothing is written and the caller must skip its side
+    /// effects (alert emission). Auto-start and manual Start share a key on purpose, so the two can
+    /// race and exactly one wins — which only works because the status change and the event insert
+    /// commit together (spec 11a §12.1).
+    /// </para>
+    /// <para>
+    /// <paramref name="measuredAt"/> is the instant the transition actually happened as the FIELD
+    /// saw it — a position's <c>DeviceDateTime</c> on the detection path. Manual overrides pass
+    /// null and get the command time. It is what <c>ActualStartAt</c>/<c>ActualEndAt</c> are
+    /// stamped with, so a measured lifecycle never carries a server clock (§12.3).
+    /// </para>
     /// </summary>
-    Task TransitionTripAsync(Guid tripId, Guid accountId, string toStatus, string? reason, bool force, CancellationToken cancellationToken);
+    Task<bool> TransitionTripAsync(
+        Guid tripId,
+        Guid accountId,
+        string toStatus,
+        string eventType,
+        string source,
+        string idempotencyKey,
+        string? payloadJson,
+        string? reason,
+        bool force,
+        DateTimeOffset? measuredAt,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// ARMS a trip: snapshots <c>OriginGeom</c> and every stop's <c>ArrivalGeom</c> and stamps
+    /// <c>ArmedAt</c>. Idempotent, and it deliberately writes NO <c>TripEvent</c> — an armed trip
+    /// that never ran must stay deletable (acceptance 16, spec 11a §6.2).
+    /// <para>
+    /// Snapshotting HERE rather than at Start is what makes auto-start possible at all: origin
+    /// arrival is the trigger, so the geometry it is judged against has to exist first. The immunity
+    /// property is unchanged — geometry is frozen before execution and never re-read mid-trip.
+    /// </para>
+    /// Returns <c>false</c> when the trip was already armed.
+    /// </summary>
+    Task<bool> ArmTripAsync(Guid tripId, Guid accountId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Replays a recorded origin visit onto a late-created trip (spec 11a §5.4). These are
+    /// MEASUREMENTS, not declarations, so they are written before the trip transitions and the
+    /// transition then stamps <c>ActualStartAt</c> from them.
+    /// </summary>
+    Task SetOriginVisitAsync(
+        Guid tripId,
+        Guid accountId,
+        DateTimeOffset? arrivedAt,
+        DateTimeOffset? departedAt,
+        CancellationToken cancellationToken);
 
     Task<TripAssignmentVm> AssignTripAsync(Guid tripId, Guid accountId, Guid driverId, Guid? transporterId, CancellationToken cancellationToken);
 
-    /// <summary>
-    /// Records the running odometer and last-seen point from the position feed.
-    /// <para>
-    /// Returns <c>false</c> when the fix was REJECTED as out-of-order or replayed (its timestamp is
-    /// not newer than the trip's <c>LastPositionAt</c>), and the caller must then skip detection for
-    /// that fix too. Detection has no independent staleness guard: arrival is covered by its
-    /// idempotency key, but the deviation run length is a plain counter that a redelivered fix would
-    /// advance three times into a false episode (spec 11 §7.4).
-    /// </para>
-    /// </summary>
-    Task<bool> UpdateTripProgressAsync(Guid tripId, Guid accountId, double latitude, double longitude, DateTimeOffset positionAt, double addedDistanceMeters, CancellationToken cancellationToken);
-
-    /// <summary>
-    /// Persists the corridor-deviation detection state.
-    /// <para>
-    /// Both values MUST survive across position batches and process restarts: Router pushes exactly
-    /// one position per transporter per call, so a run length held only in memory is discarded
-    /// before it can ever reach the three-fix threshold (spec 11 section 7.4).
-    /// </para>
-    /// <para>
-    /// <paramref name="deviationOpenedAt"/> is stamped only AFTER the alert was successfully emitted
-    /// (the geofence dwell precedent) and is cleared on re-entry so a later departure opens a NEW
-    /// episode. Because it is persisted, it is also the episode's identity: the
-    /// <c>TripEvent</c> idempotency key derives from it, so one episode mints exactly one key.
-    /// </para>
-    /// </summary>
-    Task SetDeviationStateAsync(Guid tripId, Guid accountId, DateTimeOffset? deviationOpenedAt, int consecutiveOutsideFixes, CancellationToken cancellationToken);
 }

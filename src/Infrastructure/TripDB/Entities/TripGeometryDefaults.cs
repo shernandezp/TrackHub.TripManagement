@@ -18,7 +18,8 @@ namespace TrackHub.TripManagement.Infrastructure.TripDB.Entities;
 /// <summary>Persistence-side defaults for the spatial columns (spec 11 section 6.1).</summary>
 public static class TripGeometryDefaults
 {
-    public const int ArrivalRadiusMeters = 150;
+    /// <summary>Mirrors the domain band so the column default and the validators cannot drift apart.</summary>
+    public const int ArrivalRadiusMeters = TripGeometry.DefaultRadiusMeters;
     public const int CorridorMeters = 500;
     public const int Srid = 4326;
 }

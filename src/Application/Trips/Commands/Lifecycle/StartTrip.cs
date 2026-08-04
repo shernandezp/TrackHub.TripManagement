@@ -33,7 +33,6 @@ public readonly record struct StartTripCommand(Guid TripId) : IRequest;
 public sealed class StartTripCommandHandler(
     ITripWriter writer,
     ITripReader reader,
-    ITripEventWriter tripEventWriter,
     IAlertEmitter alertEmitter,
     IUserReader userReader,
     IUser user,
@@ -45,11 +44,13 @@ public sealed class StartTripCommandHandler(
     {
         var caller = await userReader.GetUserAsync(UserId, cancellationToken);
         await TripLifecycleTransition.ExecuteAsync(
-            reader, writer, tripEventWriter, alertEmitter, logger,
+            reader, writer, alertEmitter, logger,
             request.TripId, caller.AccountId, TripVisibility.ResolveScopeUserId(user, UserId),
             TripStatuses.InProgress, TripEventTypes.TripStarted, TripAlertSeverities.Info,
+            TripEventSources.Portal,
             reason: null, force: false,
             $"trip-start:{request.TripId:N}",
+            measuredAt: null,
             cancellationToken);
     }
 }

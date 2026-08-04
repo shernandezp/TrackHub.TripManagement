@@ -13,12 +13,14 @@
 //  limitations under the License.
 //
 
+using Microsoft.Extensions.Logging.Abstractions;
 using System.Net.Sockets;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using TrackHub.TripManagement.Domain.Models;
 using TrackHub.TripManagement.Infrastructure.TripDB;
 using TrackHub.TripManagement.Infrastructure.TripDB.Readers;
+using TrackHub.TripManagement.Infrastructure.TripDB.Writers;
 
 namespace Infrastructure.UnitTests;
 
@@ -112,7 +114,7 @@ public class TripQueryTranslationTests
     public async Task GetTripsPage_GroupScoped_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetTripsPageAsync(
             AccountId, UserId, ["InProgress"], DateTimeOffset.UtcNow.AddDays(-7), DateTimeOffset.UtcNow,
@@ -123,7 +125,7 @@ public class TripQueryTranslationTests
     public async Task GetTripsPage_AccountWide_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetTripsPageAsync(
             AccountId, null, null, DateTimeOffset.UtcNow.AddDays(-7), DateTimeOffset.UtcNow,
@@ -134,7 +136,7 @@ public class TripQueryTranslationTests
     public async Task GetTripDetail_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetTripDetailAsync(
             TripId, AccountId, UserId, CancellationToken.None));
@@ -144,7 +146,7 @@ public class TripQueryTranslationTests
     public async Task GetActiveTrips_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetActiveTripsAsync(
             AccountId, UserId, CancellationToken.None));
@@ -154,7 +156,7 @@ public class TripQueryTranslationTests
     public async Task GetTimeline_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetTimelineAsync(
             TripId, AccountId, UserId, 0, 50, CancellationToken.None));
@@ -166,7 +168,7 @@ public class TripQueryTranslationTests
     public async Task GetTripReportRows_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetTripReportRowsAsync(
             AccountId, UserId, DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow,
@@ -177,7 +179,7 @@ public class TripQueryTranslationTests
     public async Task GetTripStopReportRows_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetTripStopReportRowsAsync(
             AccountId, UserId, DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow,
@@ -188,7 +190,7 @@ public class TripQueryTranslationTests
     public async Task GetTripTollReportRows_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetTripTollReportRowsAsync(
             AccountId, UserId, DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow,
@@ -199,7 +201,7 @@ public class TripQueryTranslationTests
     public async Task GetTripPodReportRows_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripReader(context);
+        var reader = new TripReader(context, new AccountFeatureReader(context));
 
         await AssertTranslatesAsync(() => reader.GetTripPodReportRowsAsync(
             AccountId, UserId, DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow,
@@ -259,23 +261,89 @@ public class TripQueryTranslationTests
     // Detection runs on every position batch from Router; an untranslatable query here would
     // silently break arrival/departure detection for every account.
     [Test]
-    public async Task GetOpenTrips_TranslatesToSql()
+    public async Task LoadWorkingSet_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
-        var reader = new TripDetectionReader(context);
+        var unit = new TripDetectionUnitOfWork(context, NullLogger<TripDetectionUnitOfWork>.Instance);
 
-        await AssertTranslatesAsync(() => reader.GetOpenTripsAsync(
-            AccountId, [Guid.NewGuid()], CancellationToken.None));
+        await AssertTranslatesAsync(() => unit.LoadAsync(
+            AccountId, [Guid.NewGuid()], DateTimeOffset.UtcNow.AddHours(1), CancellationToken.None));
+    }
+
+    /// <summary>
+    /// The armable-trip half of the working set: the NOT EXISTS that expresses the per-vehicle queue
+    /// (spec 11a §7). It is a DIFFERENT query shape from the InProgress half, and passing null for
+    /// the window skips it entirely — so it needs its own guard with the window open.
+    /// </summary>
+    [Test]
+    public async Task LoadWorkingSet_WithNoArmingWindow_TranslatesToSql()
+    {
+        using var context = NewNpgsqlContext();
+        var unit = new TripDetectionUnitOfWork(context, NullLogger<TripDetectionUnitOfWork>.Instance);
+
+        await AssertTranslatesAsync(() => unit.LoadAsync(
+            AccountId, [Guid.NewGuid()], null, CancellationToken.None));
     }
 
     [Test]
-    public async Task GetStopsContainingPoint_TranslatesToSql()
+    public async Task GetCompletionCandidates_TranslatesToSql()
     {
         using var context = NewNpgsqlContext();
         var reader = new TripDetectionReader(context);
 
-        await AssertTranslatesAsync(() => reader.GetStopsContainingPointAsync(
-            AccountId, TripId, 4.60971, -74.08175, CancellationToken.None));
+        await AssertTranslatesAsync(() => reader.GetCompletionCandidatesAsync(AccountId, CancellationToken.None));
+    }
+
+    [Test]
+    public async Task GetCompletionState_TranslatesToSql()
+    {
+        using var context = NewNpgsqlContext();
+        var reader = new TripDetectionReader(context);
+
+        await AssertTranslatesAsync(() => reader.GetCompletionStateAsync(AccountId, TripId, CancellationToken.None));
+    }
+
+    // Geofencing's visit history, read across the shared database (SVD-05) to rebuild a late-created
+    // trip from measurements (spec 11a §5.4).
+    [Test]
+    public async Task GetGeofenceVisits_TranslatesToSql()
+    {
+        using var context = NewNpgsqlContext();
+        var reader = new GeofenceVisitReader(context);
+
+        await AssertTranslatesAsync(() => reader.GetVisitsAsync(
+            AccountId, Guid.NewGuid(), [Guid.NewGuid()], DateTimeOffset.UtcNow.AddHours(-24), CancellationToken.None));
+    }
+
+    // The account's named places, resolved by a bulk upload (spec 11a §9.1). It reads a
+    // Manager-owned table and a Geofencing-owned one in the same pass.
+    [Test]
+    public async Task GetPlaces_TranslatesToSql()
+    {
+        using var context = NewNpgsqlContext();
+        var reader = new PlaceReader(context);
+
+        await AssertTranslatesAsync(() => reader.GetPlacesAsync(AccountId, CancellationToken.None));
+    }
+
+    // Bulk planning resolves the transporter column by NAME, through the same group-visibility
+    // EXISTS the trip queries use.
+    [Test]
+    public async Task GetTransporterNames_GroupScoped_TranslatesToSql()
+    {
+        using var context = NewNpgsqlContext();
+        var reader = new TripReader(context, new AccountFeatureReader(context));
+
+        await AssertTranslatesAsync(() => reader.GetTransporterNamesAsync(AccountId, UserId, CancellationToken.None));
+    }
+
+    [Test]
+    public async Task GetDriverNames_TranslatesToSql()
+    {
+        using var context = NewNpgsqlContext();
+        var reader = new TripReader(context, new AccountFeatureReader(context));
+
+        await AssertTranslatesAsync(() => reader.GetDriverNamesAsync(AccountId, CancellationToken.None));
     }
 
     [Test]

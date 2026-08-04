@@ -20,7 +20,20 @@ using TrackHub.TripManagement.Infrastructure.TripDB.Readers;
 
 namespace TrackHub.TripManagement.Infrastructure.TripDB.Writers;
 
-/// <summary>Write side of the trip aggregate: CRUD plus the lifecycle transitions.</summary>
+/// <summary>
+/// Write side of the trip aggregate: CRUD plus the lifecycle transitions.
+/// <para>
+/// <b>Every query that leads to a mutation is <c>AsTracking()</c>, and nothing here calls
+/// <c>Attach</c>.</b> The context is registered <c>NoTracking</c>, so a plain query hands back a
+/// FRESH instance each time; attaching a second instance of a row the change tracker already holds
+/// throws. That is not a rare race — it is the shape of every multi-write request this module has:
+/// detection arms a trip and then starts it, the odometer runs and then the deviation state moves,
+/// the backfill arms and then replays, both importers create and then declare. Each of those failed
+/// on its second write, and Router swallows the exception, so zero-touch simply never happened.
+/// <c>AsTracking()</c> resolves identity instead: an already-tracked row comes back as the SAME
+/// instance carrying the writes this request has already made, and a fresh one starts being tracked.
+/// </para>
+/// </summary>
 public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITripWriter
 {
     public async Task<TripVm> CreateTripAsync(TripDto trip, Guid accountId, CancellationToken cancellationToken)
@@ -40,6 +53,8 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
             CustomerName = trip.CustomerName,
             OriginName = trip.OriginName,
             OriginPoint = TripGeometryFactory.Point(trip.OriginLatitude, trip.OriginLongitude),
+            OriginGeofenceId = trip.OriginGeofenceId,
+            OriginRadiusMeters = trip.OriginRadiusMeters,
             PlannedStartAt = trip.PlannedStartAt,
             PlannedEndAt = trip.PlannedEndAt,
             Notes = trip.Notes,
@@ -67,7 +82,19 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
         await GuardUniqueCodeAsync(accountId, trip.Code, tripId, cancellationToken);
         await GuardUniqueExternalReferenceAsync(accountId, trip.ExternalReference, tripId, cancellationToken);
 
-        context.Trips.Attach(entity);
+        // What detection is measuring against must not move underneath it (spec 11a §12.4). Which
+        // unit runs the trip and where its origin zone is are the two inputs to the arm/auto-start
+        // decision, so once execution has begun they are frozen: re-pointing a running trip would
+        // silently change the meaning of measurements already taken.
+        var repointed = trip.TransporterId != entity.TransporterId
+            || trip.OriginGeofenceId != entity.OriginGeofenceId
+            || trip.OriginRadiusMeters != entity.OriginRadiusMeters
+            || !CoordinatesMatch(entity.OriginPoint, trip.OriginLatitude, trip.OriginLongitude);
+
+        if (repointed && TripStatuses.HasStarted(entity.Status))
+        {
+            throw ConflictException.WithCode(TripErrorCodes.TripArmed);
+        }
 
         entity.Code = trip.Code;
         entity.TransporterId = trip.TransporterId;
@@ -77,14 +104,37 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
         entity.CustomerName = trip.CustomerName;
         entity.OriginName = trip.OriginName;
         entity.OriginPoint = TripGeometryFactory.Point(trip.OriginLatitude, trip.OriginLongitude);
+        entity.OriginGeofenceId = trip.OriginGeofenceId;
+        entity.OriginRadiusMeters = trip.OriginRadiusMeters;
         entity.PlannedStartAt = trip.PlannedStartAt;
         entity.PlannedEndAt = trip.PlannedEndAt;
         entity.Notes = trip.Notes;
         entity.TollVehicleClass = trip.TollVehicleClass;
 
+        // A still-Created trip that was merely armed is safe to re-point — nothing has been measured
+        // yet. Disarming it here is what makes the edit take effect: the next detection cycle
+        // re-arms it against the new unit and the new origin, so an armed trip is never left
+        // watching geometry the dispatcher has already replaced.
+        if (repointed)
+        {
+            await DisarmAsync(entity, cancellationToken);
+        }
+
         entity.AddDomainEvent(new TripDomainEvent(TripEventTypes.TripUpdated, accountId, entity.TripId));
         AddAuditEvent(accountId, "UpdateTrip", entity.TripId);
-        await context.SaveChangesAsync(cancellationToken);
+
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            // xmin moved between the read and the write: detection auto-started this trip while the
+            // dispatcher was editing it. The status guard above was decided against a row that no
+            // longer exists in that state — so the edit is refused with the same conflict a started
+            // trip would have raised outright, rather than surfacing as a 500.
+            throw ConflictException.WithCode(TripErrorCodes.TripArmed);
+        }
     }
 
     public async Task DeleteTripAsync(Guid tripId, Guid accountId, CancellationToken cancellationToken)
@@ -107,15 +157,41 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
             throw ConflictException.WithCode(TripErrorCodes.TripHasHistory);
         }
 
-        context.Trips.Attach(entity);
         AddAuditEvent(accountId, "DeleteTrip", entity.TripId);
         context.Trips.Remove(entity);
         await context.SaveChangesAsync(cancellationToken);
     }
 
-    public async Task TransitionTripAsync(Guid tripId, Guid accountId, string toStatus, string? reason, bool force, CancellationToken cancellationToken)
+    /// <summary>
+    /// The single lifecycle funnel. Status change, timestamps and the timeline event are ONE save:
+    /// automation and a dispatcher can now transition the same trip at the same instant, and the
+    /// unique idempotency index is what makes exactly one of them win. Split across two saves, a
+    /// duplicate transition wrote the status change and only then discovered the event was already
+    /// there — leaving a trip started twice with one event to show for it (spec 11a §12.1).
+    /// </summary>
+    public async Task<bool> TransitionTripAsync(
+        Guid tripId,
+        Guid accountId,
+        string toStatus,
+        string eventType,
+        string source,
+        string idempotencyKey,
+        string? payloadJson,
+        string? reason,
+        bool force,
+        DateTimeOffset? measuredAt,
+        CancellationToken cancellationToken)
     {
         var entity = await FindAsync(tripId, accountId, cancellationToken);
+
+        // Idempotency BEFORE the matrix guard, the RecordStopProgressAsync shape: a replayed
+        // transition must be a silent success, not TRIP_INVALID_TRANSITION raised against a status
+        // the server itself already moved the trip to.
+        if (await context.TripEvents.AnyAsync(
+                e => e.AccountId == accountId && e.IdempotencyKey == idempotencyKey, cancellationToken))
+        {
+            return false;
+        }
 
         if (!TripStatuses.CanTransition(entity.Status, toStatus))
         {
@@ -139,33 +215,97 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
             }
         }
 
-        context.Trips.Attach(entity);
+        // Snapshotted BEFORE the transition is applied, and restored field-by-field if the save is
+        // refused. Which stops it filled has to be remembered too — see RevertAsync.
+        var filledStops = startingNow
+            ? await SnapshotArrivalGeometryAsync(entity, cancellationToken)
+            : [];
 
-        if (startingNow)
+        var revert = entity.ApplyTransition(toStatus, measuredAt, reason);
+
+        var tripEvent = new TripEvent
         {
-            await SnapshotArrivalGeometryAsync(entity, cancellationToken);
-            entity.ActualStartAt ??= DateTimeOffset.UtcNow;
+            AccountId = accountId,
+            TripId = tripId,
+            EventType = eventType,
+            OccurredAt = measuredAt ?? DateTimeOffset.UtcNow,
+            Source = source,
+            PayloadJson = payloadJson,
+            IdempotencyKey = idempotencyKey,
+        };
+
+        await context.TripEvents.AddAsync(tripEvent, cancellationToken);
+        var domainEvent = new TripDomainEvent(eventType, accountId, entity.TripId);
+        entity.AddDomainEvent(domainEvent);
+        var auditEvent = AddAuditEvent(accountId, $"TransitionTrip:{toStatus}", entity.TripId, reason);
+
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+            return true;
+        }
+        catch (DbUpdateException exception) when (UniqueViolation.Matches(exception, "ux_trip_events_idempotencykey"))
+        {
+            // The other writer got there first: this transition wrote nothing and must leave nothing.
+            Undo(tripEvent, entity, domainEvent, auditEvent, revert, filledStops);
+            return false;
+        }
+        catch (DbUpdateException exception) when (UniqueViolation.Matches(exception, "ux_trips_transporterid_inprogress"))
+        {
+            // One physical unit, one trip at a time. Reachable from a manual Start against a unit
+            // already running something else, and from two auto-starts racing on one transporter.
+            Undo(tripEvent, entity, domainEvent, auditEvent, revert, filledStops);
+            throw ConflictException.WithCode(TripErrorCodes.TransporterBusy);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            // xmin moved: the trip is no longer in the status the matrix was checked against. The
+            // caller must re-read rather than be told a stale decision succeeded.
+            Undo(tripEvent, entity, domainEvent, auditEvent, revert, filledStops);
+            throw ConflictException.WithCode(TripErrorCodes.InvalidTransition);
+        }
+    }
+
+    public async Task<bool> ArmTripAsync(Guid tripId, Guid accountId, CancellationToken cancellationToken)
+    {
+        var entity = await context.Trips
+            .AsTracking()
+            .FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken);
+
+        if (entity is null || entity.ArmedAt.HasValue)
+        {
+            return false;
         }
 
-        if (TripStatuses.IsTerminal(toStatus))
+        var originGeom = await ResolveOriginGeomAsync(entity, cancellationToken);
+        await SnapshotArrivalGeometryAsync(entity, cancellationToken);
+
+        if (!entity.Arm(originGeom, DateTimeOffset.UtcNow))
         {
-            entity.ActualEndAt ??= DateTimeOffset.UtcNow;
+            return false;
         }
 
-        // The reason is recorded on the audit row and the timeline event for EVERY transition, but
-        // it only becomes a CANCELLATION reason when the trip is actually cancelled or aborted.
-        // Forced completion passes a reason too, and stamping it here labelled a completed trip
-        // with a cancellation it never had.
-        if (!string.IsNullOrWhiteSpace(reason)
-            && (string.Equals(toStatus, TripStatuses.Cancelled, StringComparison.Ordinal)
-                || string.Equals(toStatus, TripStatuses.Aborted, StringComparison.Ordinal)))
-        {
-            entity.CancellationReason = reason;
-        }
+        // No TripEvent and no domain event on purpose: arming is the system noticing a trip, not the
+        // trip doing anything. A row here would make every armed-and-never-run trip undeletable.
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
 
-        entity.Status = toStatus;
-        entity.AddDomainEvent(new TripDomainEvent(EventTypeFor(toStatus, startingNow), accountId, entity.TripId));
-        AddAuditEvent(accountId, $"TransitionTrip:{toStatus}", entity.TripId, reason);
+    public async Task SetOriginVisitAsync(
+        Guid tripId,
+        Guid accountId,
+        DateTimeOffset? arrivedAt,
+        DateTimeOffset? departedAt,
+        CancellationToken cancellationToken)
+    {
+        var entity = await context.Trips
+            .AsTracking()
+            .FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken);
+
+        if (entity is null || !entity.RecordOriginVisit(arrivedAt, departedAt))
+        {
+            return;
+        }
 
         await context.SaveChangesAsync(cancellationToken);
     }
@@ -184,12 +324,12 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
         // Exactly one Active assignment per trip: the prior one is ENDED, never deleted, so the
         // handover history survives.
         var current = await context.TripAssignments
+            .AsTracking()
             .Where(a => a.TripId == tripId && a.Status == TripAssignmentStatuses.Active)
             .ToListAsync(cancellationToken);
 
         foreach (var previous in current)
         {
-            context.TripAssignments.Attach(previous);
             previous.Status = TripAssignmentStatuses.Ended;
             previous.EndedAt = now;
         }
@@ -204,7 +344,6 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
             AssignedAt = now,
         };
 
-        context.Trips.Attach(entity);
         entity.DriverId = driverId;
         if (transporterId is { } newTransporterId)
         {
@@ -230,93 +369,26 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
         return TripMapper.ToVm(assignment);
     }
 
-    public async Task<bool> UpdateTripProgressAsync(
-        Guid tripId,
-        Guid accountId,
-        double latitude,
-        double longitude,
-        DateTimeOffset positionAt,
-        double addedDistanceMeters,
-        CancellationToken cancellationToken)
-    {
-        var entity = await context.Trips
-            .FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken);
-
-        if (entity is null)
-        {
-            return false;
-        }
-
-        // Out-of-order or replayed fixes never rewind the odometer or the last-seen point.
-        //
-        // The rejection is REPORTED to the caller rather than swallowed. Detection must skip the
-        // same fixes this guard skips: arrival is protected by its idempotency key, but the
-        // deviation run length is a plain counter, so one genuinely out-of-corridor fix redelivered
-        // three times (a client retry, or the WithRetry policy after a timeout that had already
-        // committed) would reach the threshold and open a false episode with a real alert.
-        if (entity.LastPositionAt is { } last && positionAt <= last)
-        {
-            return false;
-        }
-
-        context.Trips.Attach(entity);
-        entity.LastPoint = TripGeometryFactory.Point(latitude, longitude);
-        entity.LastPositionAt = positionAt;
-        entity.ActualDistanceMeters += Math.Max(addedDistanceMeters, 0d);
-
-        await context.SaveChangesAsync(cancellationToken);
-
-        return true;
-    }
-
-    public async Task SetDeviationStateAsync(
-        Guid tripId,
-        Guid accountId,
-        DateTimeOffset? deviationOpenedAt,
-        int consecutiveOutsideFixes,
-        CancellationToken cancellationToken)
-    {
-        var entity = await context.Trips
-            .FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken);
-
-        if (entity is null)
-        {
-            return;
-        }
-
-        // Nothing to write when the state is already where the caller wants it - detection touches
-        // this on every out-of-corridor fix, and an UPDATE per fix per trip is pure noise.
-        if (entity.DeviationOpenedAt == deviationOpenedAt && entity.ConsecutiveOutsideFixes == consecutiveOutsideFixes)
-        {
-            return;
-        }
-
-        context.Trips.Attach(entity);
-
-        // Deliberately a plain assignment, not `??=`: an episode must be able to CLOSE on re-entry
-        // so a later departure opens a new one (acceptance 14). The one-shot guarantee lives in the
-        // caller, which stamps only after a successful emission and only while nothing is open.
-        entity.DeviationOpenedAt = deviationOpenedAt;
-        entity.ConsecutiveOutsideFixes = consecutiveOutsideFixes;
-
-        await context.SaveChangesAsync(cancellationToken);
-    }
-
     /// <summary>
-    /// Freezes each stop's arrival geometry at the moment the trip starts (spec 11 section 18.4):
-    /// the linked geofence's polygon when <c>GeofenceId</c> is set, otherwise the stop point
-    /// buffered by its radius. Reading the geofence ONCE, here, is exactly what makes a running
-    /// trip immune to a geofence being edited mid-execution.
+    /// Freezes each stop's arrival geometry (spec 11 §18.4): the linked geofence's polygon when
+    /// <c>GeofenceId</c> is set, otherwise the stop point buffered by its radius. Reading the
+    /// geofence ONCE is exactly what makes a running trip immune to a geofence edited mid-execution.
+    /// <para>
+    /// Only null geometries are filled. A stop already snapshotted at arming keeps the shape its
+    /// detection has been judged against — re-reading it at start would reintroduce the very
+    /// mid-flight mutability the snapshot exists to prevent.
+    /// </para>
     /// </summary>
-    private async Task SnapshotArrivalGeometryAsync(Trip trip, CancellationToken cancellationToken)
+    private async Task<IReadOnlyCollection<TripStop>> SnapshotArrivalGeometryAsync(Trip trip, CancellationToken cancellationToken)
     {
         var stops = await context.TripStops
-            .Where(s => s.TripId == trip.TripId && s.AccountId == trip.AccountId)
+            .AsTracking()
+            .Where(s => s.TripId == trip.TripId && s.AccountId == trip.AccountId && s.ArrivalGeom == null)
             .ToListAsync(cancellationToken);
 
         if (stops.Count == 0)
         {
-            return;
+            return [];
         }
 
         var geofenceIds = stops.Where(s => s.GeofenceId.HasValue)
@@ -332,26 +404,105 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
 
         foreach (var stop in stops)
         {
-            context.TripStops.Attach(stop);
-
             stop.ArrivalGeom = stop.GeofenceId is { } geofenceId && geofences.TryGetValue(geofenceId, out var geom)
                 ? geom
                 : TripGeometryFactory.Buffer(stop.Point, stop.ArrivalRadiusMeters);
         }
+
+        return stops;
     }
 
-    private static string EventTypeFor(string toStatus, bool startingNow) => toStatus switch
+    /// <summary>
+    /// The origin zone: the linked geofence's real shape, or the origin point buffered by
+    /// <c>OriginRadiusMeters</c> for a POI/ad-hoc point. Same rule as a stop, so a trip's ends are
+    /// measured the same way as its middle.
+    /// </summary>
+    private async Task<NetTopologySuite.Geometries.Polygon> ResolveOriginGeomAsync(Trip trip, CancellationToken cancellationToken)
     {
-        TripStatuses.InProgress => startingNow ? TripEventTypes.TripStarted : TripEventTypes.TripResumed,
-        TripStatuses.Paused => TripEventTypes.TripPaused,
-        TripStatuses.Completed => TripEventTypes.TripCompleted,
-        TripStatuses.Cancelled => TripEventTypes.TripCancelled,
-        TripStatuses.Aborted => TripEventTypes.TripAborted,
-        _ => TripEventTypes.TripUpdated,
-    };
+        if (trip.OriginGeofenceId is { } geofenceId)
+        {
+            var geom = await context.Geofences
+                .Where(g => g.GeofenceId == geofenceId && g.AccountId == trip.AccountId)
+                .Select(g => g.Geom)
+                .FirstOrDefaultAsync(cancellationToken);
+
+            if (geom is not null)
+            {
+                return geom;
+            }
+        }
+
+        return TripGeometryFactory.Buffer(trip.OriginPoint, trip.OriginRadiusMeters);
+    }
+
+    /// <summary>
+    /// Drops the arming snapshots so the next detection cycle rebuilds them against the edited plan.
+    /// Only ever reached for a trip that has not started, so no measurement is being discarded.
+    /// </summary>
+    private async Task DisarmAsync(Trip trip, CancellationToken cancellationToken)
+    {
+        trip.Disarm();
+
+        var stops = await context.TripStops
+            .AsTracking()
+            .Where(s => s.TripId == trip.TripId && s.AccountId == trip.AccountId && s.ArrivalGeom != null)
+            .ToListAsync(cancellationToken);
+
+        foreach (var stop in stops)
+        {
+            stop.ArrivalGeom = null;
+        }
+    }
+
+    /// <summary>
+    /// Compared at the precision the portal actually sends (six decimals, ~0.1 m): a float-exact
+    /// test would read every save as a re-point and disarm trips nobody edited.
+    /// </summary>
+    private static bool CoordinatesMatch(NetTopologySuite.Geometries.Point origin, double latitude, double longitude)
+        => Math.Abs(origin.Y - latitude) < 1e-6 && Math.Abs(origin.X - longitude) < 1e-6;
+
+    /// <summary>
+    /// Undoes exactly what the rejected transition staged, and nothing else.
+    /// <para>
+    /// The rows this operation INSERTED are detached — they were never persisted, and the context is
+    /// request-scoped, so leaving them would replay a dead insert and an audit row for a transition
+    /// the database refused. The rows it MUTATED are reverted field-by-field instead.
+    /// </para>
+    /// <para>
+    /// That distinction is the whole point. Detaching the trip was simpler and wrong: the same row
+    /// carries the odometer, the debounce clocks and the deviation counter that the detection pass
+    /// buffered for this very fix, so undoing a losing transition by detaching silently discarded
+    /// measurements that had nothing to do with it. Reverting only <see cref="TripTransitionRevert"/>
+    /// leaves those pending, and the next save commits them as it should.
+    /// </para>
+    /// </summary>
+    private void Undo(
+        TripEvent tripEvent,
+        Trip trip,
+        TripDomainEvent domainEvent,
+        AuditEvent auditEvent,
+        TripTransitionRevert revert,
+        IReadOnlyCollection<TripStop> filledStops)
+    {
+        context.TripEvents.Entry(tripEvent).State = EntityState.Detached;
+        context.AuditEvents.Entry(auditEvent).State = EntityState.Detached;
+
+        // Only the event THIS call queued: another operation in the same request may legitimately
+        // have queued its own on the same row.
+        trip.RemoveDomainEvent(domainEvent);
+        trip.RevertTransition(revert);
+
+        // A start that did not happen must not leave the route armed. Only the stops this call
+        // actually filled are cleared — one snapshotted earlier, by arming, is a measurement in its
+        // own right and detection is already judging arrivals against it.
+        foreach (var stop in filledStops)
+        {
+            stop.ArrivalGeom = null;
+        }
+    }
 
     private async Task<Trip> FindAsync(Guid tripId, Guid accountId, CancellationToken cancellationToken)
-        => await context.Trips.FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken)
+        => await context.Trips.AsTracking().FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken)
             ?? throw new NotFoundException($"{tripId}", nameof(Trip));
 
     private async Task GuardUniqueCodeAsync(Guid accountId, string code, Guid? excludeTripId, CancellationToken cancellationToken)
@@ -385,7 +536,7 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
         }
     }
 
-    private void AddAuditEvent(Guid accountId, string action, Guid tripId, string? reason = null)
+    private AuditEvent AddAuditEvent(Guid accountId, string action, Guid tripId, string? reason = null)
         => context.AuditEvents.Add(new AuditEvent(
             accountId,
             user.PrincipalType.ToString(),
@@ -399,5 +550,5 @@ public sealed class TripWriter(IApplicationDbContext context, IUser user) : ITri
             reason,
             null,
             null,
-            user.CorrelationId));
+            user.CorrelationId)).Entity;
 }

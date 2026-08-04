@@ -35,6 +35,10 @@ public class TripLifecycleTests
     [TestCase(TripStatuses.Paused, TripStatuses.InProgress)]
     [TestCase(TripStatuses.Paused, TripStatuses.Cancelled)]
     [TestCase(TripStatuses.Paused, TripStatuses.Aborted)]
+
+    // Added by spec 11a §5.1. Without it a dispatcher who had paused a finished trip had to Resume
+    // it — briefly handing it back to automation — purely so they could close it.
+    [TestCase(TripStatuses.Paused, TripStatuses.Completed)]
     public void CanTransition_AllowsTheMatrix(string from, string to)
         => Assert.That(TripStatuses.CanTransition(from, to), Is.True);
 
@@ -54,23 +58,50 @@ public class TripLifecycleTests
     public void Terminal_StatusesAreTerminal(string status)
         => Assert.That(TripStatuses.IsTerminal(status), Is.True);
 
+    /// <summary>
+    /// The source is PARAMETERIZED now (spec 11a §15): a manual Start is <c>Portal</c>, an
+    /// auto-start is <c>Detection</c>, and both mint the same idempotency key so exactly one of a
+    /// racing pair ever lands. Pinning <c>Portal</c> into the assertion was what made the old test
+    /// pass while the writer hardcoded it.
+    /// </summary>
     [Test]
-    public async Task StartTrip_TransitionsAndAppendsExactlyOneEvent()
+    public async Task StartTrip_TransitionsAndRecordsExactlyOnePortalSourcedEvent()
     {
         var harness = new LifecycleHarness(TripStatuses.Created);
         var handler = new StartTripCommandHandler(
-            harness.Writer.Object, harness.Reader.Object, harness.EventWriter.Object,
+            harness.Writer.Object, harness.Reader.Object,
             harness.AlertEmitter.Object, harness.UserReader.Object, harness.User.Object,
             TestFactory.Logger<StartTripCommandHandler>());
 
         await handler.Handle(new StartTripCommand(TestFactory.TripId), CancellationToken.None);
 
+        // One call, carrying the event type, source and key: status and timeline commit together
+        // now, so there is no second write to verify (§12.1).
         harness.Writer.Verify(w => w.TransitionTripAsync(
-            TestFactory.TripId, TestFactory.AccountId, TripStatuses.InProgress, null, false, It.IsAny<CancellationToken>()), Times.Once);
-        harness.EventWriter.Verify(w => w.AppendAsync(
-            TestFactory.AccountId, TestFactory.TripId, null, TripEventTypes.TripStarted,
-            It.IsAny<DateTimeOffset>(), TripEventSources.Portal, null,
-            $"trip-start:{TestFactory.TripId:N}", It.IsAny<CancellationToken>()), Times.Once);
+            TestFactory.TripId, TestFactory.AccountId, TripStatuses.InProgress,
+            TripEventTypes.TripStarted, TripEventSources.Portal, $"trip-start:{TestFactory.TripId:N}",
+            null, null, false, null, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    /// <summary>
+    /// A duplicate or a lost race writes nothing, so it must emit nothing. The writer answering
+    /// <c>false</c> used to be discarded, which is how a manual Start racing an auto-start produced
+    /// two <c>TripStarted</c> alerts for one trip (spec 11a §12.1).
+    /// </summary>
+    [Test]
+    public async Task StartTrip_WhenTheTransitionWasAlreadyRecorded_EmitsNoAlert()
+    {
+        var harness = new LifecycleHarness(TripStatuses.Created);
+        harness.TransitionResult = false;
+
+        var handler = new StartTripCommandHandler(
+            harness.Writer.Object, harness.Reader.Object,
+            harness.AlertEmitter.Object, harness.UserReader.Object, harness.User.Object,
+            TestFactory.Logger<StartTripCommandHandler>());
+
+        await handler.Handle(new StartTripCommand(TestFactory.TripId), CancellationToken.None);
+
+        harness.AlertEmitter.VerifyNoOtherCalls();
     }
 
     [Test]
@@ -78,7 +109,7 @@ public class TripLifecycleTests
     {
         var harness = new LifecycleHarness(TripStatuses.Completed);
         var handler = new StartTripCommandHandler(
-            harness.Writer.Object, harness.Reader.Object, harness.EventWriter.Object,
+            harness.Writer.Object, harness.Reader.Object,
             harness.AlertEmitter.Object, harness.UserReader.Object, harness.User.Object,
             TestFactory.Logger<StartTripCommandHandler>());
 
@@ -86,7 +117,6 @@ public class TripLifecycleTests
             await handler.Handle(new StartTripCommand(TestFactory.TripId), CancellationToken.None));
 
         harness.Writer.VerifyNoOtherCalls();
-        harness.EventWriter.VerifyNoOtherCalls();
     }
 
     [Test]
@@ -94,7 +124,7 @@ public class TripLifecycleTests
     {
         var harness = new LifecycleHarness(TripStatuses.Created);
         var handler = new PauseTripCommandHandler(
-            harness.Writer.Object, harness.Reader.Object, harness.EventWriter.Object,
+            harness.Writer.Object, harness.Reader.Object,
             harness.AlertEmitter.Object, harness.UserReader.Object, harness.User.Object,
             TestFactory.Logger<PauseTripCommandHandler>());
 
@@ -113,7 +143,7 @@ public class TripLifecycleTests
             .ReturnsAsync(new TripDetailVm(TestFactory.Trip(), [TestFactory.Stop(TripStopStatuses.Arrived)], null, null, [], []));
 
         var handler = new CompleteTripCommandHandler(
-            harness.Writer.Object, harness.Reader.Object, harness.EventWriter.Object,
+            harness.Writer.Object, harness.Reader.Object,
             harness.AlertEmitter.Object, harness.UserReader.Object, harness.User.Object,
             TestFactory.Logger<CompleteTripCommandHandler>());
 
@@ -129,14 +159,16 @@ public class TripLifecycleTests
     {
         var harness = new LifecycleHarness(TripStatuses.InProgress);
         var handler = new CompleteTripCommandHandler(
-            harness.Writer.Object, harness.Reader.Object, harness.EventWriter.Object,
+            harness.Writer.Object, harness.Reader.Object,
             harness.AlertEmitter.Object, harness.UserReader.Object, harness.User.Object,
             TestFactory.Logger<CompleteTripCommandHandler>());
 
         await handler.Handle(new CompleteTripCommand(TestFactory.TripId, true), CancellationToken.None);
 
         harness.Writer.Verify(w => w.TransitionTripAsync(
-            TestFactory.TripId, TestFactory.AccountId, TripStatuses.Completed, "forced", true, It.IsAny<CancellationToken>()), Times.Once);
+            TestFactory.TripId, TestFactory.AccountId, TripStatuses.Completed,
+            TripEventTypes.TripCompleted, TripEventSources.Portal, $"trip-complete:{TestFactory.TripId:N}",
+            It.IsAny<string?>(), "forced", true, null, It.IsAny<CancellationToken>()), Times.Once);
         harness.Reader.Verify(r => r.GetTripDetailAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<Guid?>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
@@ -152,14 +184,16 @@ public class TripLifecycleTests
                 null, null, [], []));
 
         var handler = new CompleteTripCommandHandler(
-            harness.Writer.Object, harness.Reader.Object, harness.EventWriter.Object,
+            harness.Writer.Object, harness.Reader.Object,
             harness.AlertEmitter.Object, harness.UserReader.Object, harness.User.Object,
             TestFactory.Logger<CompleteTripCommandHandler>());
 
         await handler.Handle(new CompleteTripCommand(TestFactory.TripId, false), CancellationToken.None);
 
         harness.Writer.Verify(w => w.TransitionTripAsync(
-            TestFactory.TripId, TestFactory.AccountId, TripStatuses.Completed, null, false, It.IsAny<CancellationToken>()), Times.Once);
+            TestFactory.TripId, TestFactory.AccountId, TripStatuses.Completed,
+            TripEventTypes.TripCompleted, TripEventSources.Portal, $"trip-complete:{TestFactory.TripId:N}",
+            null, null, false, null, It.IsAny<CancellationToken>()), Times.Once);
     }
 
     private sealed class LifecycleHarness
@@ -169,19 +203,18 @@ public class TripLifecycleTests
             Reader.Setup(r => r.GetTripAsync(TestFactory.TripId, TestFactory.AccountId, It.IsAny<Guid?>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(TestFactory.Trip(status));
             Writer.Setup(w => w.TransitionTripAsync(
-                    It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-                .Returns(Task.CompletedTask);
-            EventWriter.Setup(w => w.AppendAsync(
-                    It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<Guid?>(), It.IsAny<string>(), It.IsAny<DateTimeOffset>(),
-                    It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync(true);
+                    It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                    It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<bool>(),
+                    It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() => TransitionResult);
         }
+
+        /// <summary>What the funnel answers — false is a duplicate or a lost race.</summary>
+        public bool TransitionResult { get; set; } = true;
 
         public Mock<ITripWriter> Writer { get; } = new(MockBehavior.Strict);
 
         public Mock<ITripReader> Reader { get; } = new();
-
-        public Mock<ITripEventWriter> EventWriter { get; } = new(MockBehavior.Strict);
 
         public Mock<IAlertEmitter> AlertEmitter { get; } = new();
 

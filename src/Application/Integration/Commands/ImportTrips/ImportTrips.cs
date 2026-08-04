@@ -15,6 +15,7 @@
 
 using Microsoft.Extensions.Logging;
 using TrackHub.TripManagement.Application.Common;
+using TrackHub.TripManagement.Application.Trips.Services.Interfaces;
 
 namespace TrackHub.TripManagement.Application.Integration.Commands.ImportTrips;
 
@@ -40,6 +41,7 @@ public sealed class ImportTripsCommandHandler(
     ITripReader reader,
     ITripStopWriter stopWriter,
     IManagerValidationClient managerValidationClient,
+    ITripStartBackfillService backfillService,
     ILogger<ImportTripsCommandHandler> logger) : IRequestHandler<ImportTripsCommand, IReadOnlyCollection<TripImportResultVm>>
 {
     public async Task<IReadOnlyCollection<TripImportResultVm>> Handle(ImportTripsCommand request, CancellationToken cancellationToken)
@@ -88,6 +90,13 @@ public sealed class ImportTripsCommandHandler(
         foreach (var stop in item.Stops)
             await TripVisibility.EnsureGeofenceInAccountAsync(reader, stop.GeofenceId, accountId, cancellationToken);
 
+        await TripVisibility.EnsureGeofenceInAccountAsync(reader, item.OriginGeofenceId, accountId, cancellationToken);
+
+        var existing = await TripLookup.FindByExternalReferenceAsync(reader, accountId, item.ExternalReference, cancellationToken);
+
+        // The partner contract carries no origin radius, so a re-send must not silently reset one a
+        // dispatcher widened in the portal — that would shrink a large yard's origin zone back to
+        // 150 m and quietly stop the trip auto-starting.
         var dto = new TripDto(
             item.Code,
             item.TransporterId,
@@ -98,18 +107,33 @@ public sealed class ImportTripsCommandHandler(
             item.OriginName,
             item.OriginLatitude,
             item.OriginLongitude,
+            item.OriginGeofenceId,
+            existing?.OriginRadiusMeters ?? TripGeometry.DefaultRadiusMeters,
             item.PlannedStartAt,
             item.PlannedEndAt,
             item.Notes,
             null);
 
-        var existing = await TripLookup.FindByExternalReferenceAsync(reader, accountId, item.ExternalReference, cancellationToken);
         if (existing is { } current)
         {
             if (TripStatuses.IsTerminal(current.Status))
                 return new TripImportResultVm(item.ExternalReference, false, current.TripId, TripErrorCodes.TripAlreadyTerminal, "Trip is closed.");
 
             await writer.UpdateTripAsync(current.TripId, dto, accountId, cancellationToken);
+
+            // The stops payload used to be dropped here without a word, so a partner's weekly
+            // re-upload could revise a trip's header and never its route — the one thing a re-plan
+            // usually changes (spec 11a §9.2). Only a trip still in Created may be re-routed: once
+            // it is running, its stops carry measurements and a replacement would erase them.
+            if (item.Stops.Count > 0)
+            {
+                if (!string.Equals(current.Status, TripStatuses.Created, StringComparison.Ordinal))
+                    return new TripImportResultVm(item.ExternalReference, false, current.TripId, TripErrorCodes.TripNotActive, "Stops cannot be replaced once the trip has started.");
+
+                await stopWriter.ReplaceStopsAsync(current.TripId, accountId, item.Stops, cancellationToken);
+            }
+
+            await DeclareInTransitIfRequestedAsync(current.TripId, accountId, item, cancellationToken);
             return new TripImportResultVm(item.ExternalReference, true, current.TripId, null, null);
         }
 
@@ -117,7 +141,25 @@ public sealed class ImportTripsCommandHandler(
         foreach (var stop in item.Stops)
             await stopWriter.AddStopAsync(created.TripId, accountId, stop, cancellationToken);
 
+        await DeclareInTransitIfRequestedAsync(created.TripId, accountId, item, cancellationToken);
         return new TripImportResultVm(item.ExternalReference, true, created.TripId, null, null);
+    }
+
+    /// <summary>
+    /// A partner that reports <c>startedAt</c> is telling us the truck already left. Backfill runs
+    /// LAST, once the row's stops exist, because it replays the route (spec 11a §5.4).
+    /// <para>
+    /// The caller here is a tenant-bound service client, not a user, so there is no group scope to
+    /// resolve — it sees the whole account by design (SVD-13).
+    /// </para>
+    /// </summary>
+    private async Task DeclareInTransitIfRequestedAsync(
+        Guid tripId, Guid accountId, TripImportDto item, CancellationToken cancellationToken)
+    {
+        if (item.StartedAt is null)
+            return;
+
+        await backfillService.ApplyAsync(tripId, accountId, null, item.StartedAt, cancellationToken);
     }
 }
 

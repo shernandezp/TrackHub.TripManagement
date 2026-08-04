@@ -19,6 +19,13 @@ namespace TrackHub.TripManagement.Domain.Models;
 /// Trip-level export row. Flat by design: a report row is READ, never joined. Display names and the
 /// route-plan roll-up are resolved server-side so Reporting drains one paged feed instead of
 /// fanning out per row to Manager (spec 11 §13).
+/// <para>
+/// The measured durations answer the question the module exists to answer — how long did loading,
+/// transit and the whole trip actually take (spec 11a §13). They are computed here rather than in
+/// Reporting so every consumer gets the same arithmetic, and each is null when the measurement it
+/// depends on was never taken: a trip whose start was declared has no loading time, and saying so
+/// beats reporting zero.
+/// </para>
 /// </summary>
 public readonly record struct TripReportRowVm(
     Guid TripId,
@@ -38,6 +45,11 @@ public readonly record struct TripReportRowVm(
     DateTimeOffset? PlannedEndAt,
     DateTimeOffset? ActualStartAt,
     DateTimeOffset? ActualEndAt,
+    DateTimeOffset? OriginArrivedAt,
+    DateTimeOffset? OriginDepartedAt,
+    int? LoadingMinutes,
+    int? TransitMinutes,
+    int? TotalMinutes,
     string? Notes,
     DateTimeOffset? LastPositionAt,
     double? LastLatitude,
@@ -73,6 +85,11 @@ public readonly record struct TripReportPageVm(IReadOnlyCollection<TripReportRow
 /// falling back to the trip's customer when the stop has no delivery. The four counts bucket the
 /// stop's deliveries by status: <c>Delivered</c>, <c>Rejected</c> and <c>PartiallyDelivered</c>.
 /// </summary>
+/// <param name="Activity">
+/// What the vehicle did here. It is what turns the dwell between
+/// <paramref name="ActualArrivalAt"/> and <paramref name="ActualDepartureAt"/> from an anonymous
+/// number of minutes into loading or unloading time (spec 11a §13).
+/// </param>
 public readonly record struct TripStopReportRowVm(
     Guid TripStopId,
     Guid TripId,
@@ -82,6 +99,7 @@ public readonly record struct TripStopReportRowVm(
     string? CustomerName,
     int Sequence,
     string Name,
+    string Activity,
     string Status,
     DateTimeOffset? PlannedArrivalFrom,
     DateTimeOffset? PlannedArrivalTo,

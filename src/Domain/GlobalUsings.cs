@@ -13,5 +13,6 @@
 //  limitations under the License.
 //
 
+global using TrackHub.TripManagement.Domain.Constants;
 global using TrackHub.TripManagement.Domain.Models;
 global using TrackHub.TripManagement.Domain.Records;

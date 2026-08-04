@@ -166,6 +166,46 @@ public class ProofOfDeliveryAndDeliveryOutcomeTests
     private static ProofOfDeliveryDto Pod()
         => new(TestFactory.StopId, null, "R. Gomez", null, null, DateTimeOffset.UtcNow, 4.7, -74.0, [DocumentId], ClientEventId);
 
+    /// <summary>
+    /// A POD the server already holds is re-accepted even though the trip has since closed. Found by
+    /// the deployed smoke suite.
+    /// <para>
+    /// POD is the last thing recorded at a stop, and closing that stop auto-completes the trip
+    /// (§5.2) — so by the time an offline device re-sends, the trip is routinely terminal. Answering
+    /// <c>TRIP_ALREADY_TERMINAL</c> to a submission already on file is a permanent failure spec 10's
+    /// outbox can only retry forever, which is exactly what acceptance 15 forbids.
+    /// </para>
+    /// </summary>
+    [Test]
+    public async Task ReplayingAPodTheServerAlreadyHas_SucceedsEvenAfterTheTripHasClosed()
+    {
+        var harness = new PodHarness("Clean", TestFactory.AccountId) { Created = false };
+        harness.Reader.Setup(r => r.GetTripAsync(TestFactory.TripId, TestFactory.AccountId, It.IsAny<Guid?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TestFactory.Trip(TripStatuses.Completed));
+        harness.Writer.Setup(w => w.HasAsync(
+                TestFactory.AccountId, TestFactory.StopId, It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var result = await harness.Handler().Handle(new RecordProofOfDeliveryCommand(TestFactory.TripId, Pod()), CancellationToken.None);
+
+        Assert.That(result.ProofOfDeliveryId, Is.Not.EqualTo(Guid.Empty),
+            "the server already stored this POD; the terminal guard must not now reject it");
+    }
+
+    /// <summary>A genuinely NEW proof of delivery on a closed trip is still refused.</summary>
+    [Test]
+    public void ANewPodOnAClosedTrip_IsStillRejected()
+    {
+        var harness = new PodHarness("Clean", TestFactory.AccountId);
+        harness.Reader.Setup(r => r.GetTripAsync(TestFactory.TripId, TestFactory.AccountId, It.IsAny<Guid?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TestFactory.Trip(TripStatuses.Completed));
+
+        var ex = Assert.ThrowsAsync<ValidationException>(async () =>
+            await harness.Handler().Handle(new RecordProofOfDeliveryCommand(TestFactory.TripId, Pod()), CancellationToken.None));
+
+        Assert.That(ex!.Errors.Values.SelectMany(v => v), Does.Contain(TripErrorCodes.TripAlreadyTerminal));
+    }
+
     private sealed class PodHarness
     {
         public PodHarness(string? scanStatus, Guid? documentAccountId)

@@ -14,6 +14,7 @@
 //
 
 using TrackHub.TripManagement.Application.TripEvents.Services;
+using TrackHub.TripManagement.Application.Trips.Services.Interfaces;
 
 namespace TrackHub.TripManagement.Application.UnitTests;
 
@@ -242,14 +243,14 @@ public class TripDetectionServiceTests
         await service.ProcessPositionsAsync([TestFactory.Position(9.2, -70.2, T0.AddMinutes(2))], TestFactory.AccountId, CancellationToken.None);
 
         // Nothing is stamped while the episode is still climbing to the threshold ...
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            TestFactory.TripId, TestFactory.AccountId, null, 1, It.IsAny<CancellationToken>()), Times.Once);
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            TestFactory.TripId, TestFactory.AccountId, null, 2, It.IsAny<CancellationToken>()), Times.Once);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            TestFactory.TripId, null, 1), Times.Once);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            TestFactory.TripId, null, 2), Times.Once);
 
         // ... and the stamp carries the instant the episode opened, which is its identity.
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            TestFactory.TripId, TestFactory.AccountId, T0.AddMinutes(2), 3, It.IsAny<CancellationToken>()), Times.Once);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            TestFactory.TripId, T0.AddMinutes(2), 3), Times.Once);
     }
 
     [Test]
@@ -317,8 +318,8 @@ public class TripDetectionServiceTests
         }));
 
         // Re-entry closed the episode in the database, not only in memory.
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            TestFactory.TripId, TestFactory.AccountId, null, 0, It.IsAny<CancellationToken>()), Times.Once);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            TestFactory.TripId, null, 0), Times.Once);
     }
 
     [Test]
@@ -380,8 +381,8 @@ public class TripDetectionServiceTests
 
         // The run length is still persisted: the vehicle really is outside, and losing the count
         // would restart the climb to the threshold on every failed emission.
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            TestFactory.TripId, TestFactory.AccountId, null, 3, It.IsAny<CancellationToken>()), Times.Once);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            TestFactory.TripId, null, 3), Times.Once);
     }
 
     [Test]
@@ -504,7 +505,7 @@ public class TripDetectionServiceTests
     [Test]
     public async Task Deviation_ARedeliveredOutOfCorridorFixDoesNotAdvanceTheRunLength()
     {
-        // The reason UpdateTripProgressAsync returns bool at all. Arrival is protected by its
+        // The reason TryAdvanceProgress returns bool at all. Arrival is protected by its
         // idempotency key, but the deviation run length is a plain counter: ONE genuinely
         // out-of-corridor fix redelivered three times (a client retry, or the WithRetry policy
         // firing after a timeout on a call that had already committed) would reach the three-fix
@@ -523,10 +524,10 @@ public class TripDetectionServiceTests
         }
 
         Assert.That(raised, Is.Zero, "one fix delivered three times is one fix, not three");
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            TestFactory.TripId, TestFactory.AccountId, It.IsAny<DateTimeOffset?>(), 1, It.IsAny<CancellationToken>()), Times.Once);
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            TestFactory.TripId, TestFactory.AccountId, It.IsAny<DateTimeOffset?>(), 2, It.IsAny<CancellationToken>()), Times.Never);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            TestFactory.TripId, It.IsAny<DateTimeOffset?>(), 1), Times.Once);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            TestFactory.TripId, It.IsAny<DateTimeOffset?>(), 2), Times.Never);
     }
 
     // ----- The corridor's three-way answer -----------------------------------------------------
@@ -568,8 +569,8 @@ public class TripDetectionServiceTests
         await harness.Service().ProcessPositionsAsync(
             [TestFactory.Position(4.7, -74.0, T0)], TestFactory.AccountId, CancellationToken.None);
 
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<DateTimeOffset?>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            It.IsAny<Guid>(), It.IsAny<DateTimeOffset?>(), It.IsAny<int>()), Times.Never);
     }
 
     [Test]
@@ -585,12 +586,19 @@ public class TripDetectionServiceTests
         await harness.Service().ProcessPositionsAsync(
             [TestFactory.Position(4.7, -74.0, T0.AddMinutes(1))], TestFactory.AccountId, CancellationToken.None);
 
-        harness.TripWriter.Verify(w => w.SetDeviationStateAsync(
-            It.IsAny<Guid>(), It.IsAny<Guid>(), null, 0, It.IsAny<CancellationToken>()), Times.Never);
+        harness.UnitOfWork.Verify(u => u.SetDeviationState(
+            It.IsAny<Guid>(), null, 0), Times.Never);
     }
 
+    /// <summary>
+    /// An EMPTY working set short-circuits — which is a different statement from the one this test
+    /// used to make. Before zero-touch the reader could only ever return <c>InProgress</c> trips, so
+    /// "no open trips" and "nothing to do" were the same thing; now a <c>Created</c> trip in its
+    /// activation window is very much actionable, and the reader decides. What is still true is that
+    /// a batch the reader answers with nothing costs nothing.
+    /// </summary>
     [Test]
-    public async Task NoOpenTrips_ShortCircuits()
+    public async Task AnEmptyWorkingSet_ShortCircuits()
     {
         var harness = new DetectionHarness(openTrips: []);
 
@@ -600,9 +608,296 @@ public class TripDetectionServiceTests
         Assert.That(result, Is.EqualTo(new TripProcessingResultVm(1, 0, 0, 0)));
     }
 
+    // ----- Zero-touch lifecycle (spec 11a §5-§7) ------------------------------------------------
+
+    [Test]
+    public async Task Arming_HappensOnceAndWritesNoEvent()
+    {
+        // Arming must leave NO TripEvent: a trip that was armed and never ran has to stay deletable
+        // (acceptance 16). A Detection-sourced row here would quietly make every queued trip
+        // permanent the moment its window opened.
+        var harness = new DetectionHarness(status: TripStatuses.Created);
+        var service = harness.Service();
+
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0)], TestFactory.AccountId, CancellationToken.None);
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0.AddMinutes(1))], TestFactory.AccountId, CancellationToken.None);
+
+        harness.UnitOfWork.Verify(u => u.ArmAsync(TestFactory.TripId, It.IsAny<CancellationToken>()), Times.Once);
+        harness.EventWriter.VerifyNoOtherCalls();
+    }
+
+    [Test]
+    public async Task AutoStart_FiresWhenTheUnitIsInsideTheOriginZone_StampingTheDeviceTime()
+    {
+        var harness = new DetectionHarness(status: TripStatuses.Created);
+        harness.InsideOrigin = true;
+
+        await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(4.65, -74.05, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            // OriginArrivedAt is stamped BEFORE the transition, so the funnel adopts it as the
+            // measured ActualStartAt instead of reaching for the server clock (§12.3).
+            harness.UnitOfWork.Verify(u => u.RecordOriginVisit(TestFactory.TripId, T0, null), Times.Once);
+
+            // The SAME key manual Start uses: the two paths race safely and exactly one wins.
+            harness.TripWriter.Verify(w => w.TransitionTripAsync(
+                TestFactory.TripId, TestFactory.AccountId, TripStatuses.InProgress,
+                TripEventTypes.TripStarted, TripEventSources.Detection, $"trip-start:{TestFactory.TripId:N}",
+                null, null, false, T0, It.IsAny<CancellationToken>()), Times.Once);
+        });
+    }
+
+    [Test]
+    public async Task AutoStart_DoesNotFireWhileTheUnitIsAwayFromTheOrigin()
+    {
+        var harness = new DetectionHarness(status: TripStatuses.Created);
+        harness.InsideOrigin = false;
+
+        await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        harness.TripWriter.Verify(w => w.TransitionTripAsync(
+            It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+            It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<bool>(),
+            It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    /// <summary>
+    /// THE hazard spec 11 §10 refused to accept, and the reason §6 puts auto-start before the
+    /// odometer: nothing may accrue against a trip that has not measurably started. A queued trip
+    /// that picks up a distance baseline would report a journey it never made.
+    /// </summary>
+    [Test]
+    public async Task AQueuedTrip_AccruesNoOdometerBeforeItStarts()
+    {
+        var harness = new DetectionHarness(status: TripStatuses.Created);
+        harness.InsideOrigin = false;
+
+        await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        harness.UnitOfWork.Verify(u => u.TryAdvanceProgress(
+            It.IsAny<Guid>(), It.IsAny<double>(), It.IsAny<double>(),
+            It.IsAny<DateTimeOffset>(), It.IsAny<double>()), Times.Never);
+    }
+
+    [Test]
+    public async Task OriginDeparture_RequiresTheSameThirtySecondDebounceAcrossCalls()
+    {
+        // One position per call — the deployed shape. A per-request clock would be re-stamped every
+        // call and the window could never elapse, which is the defect that killed stop departure
+        // detection in production.
+        var harness = new DetectionHarness(hasOriginGeom: true, armedAt: T0.AddHours(-1));
+        harness.StopsContainingPoint();
+        var service = harness.Service();
+
+        harness.InsideOrigin = false;
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        harness.UnitOfWork.Verify(u => u.TryRecordOriginDeparture(
+            It.IsAny<Guid>(), It.IsAny<DateTimeOffset>()), Times.Never);
+
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0.AddSeconds(31))], TestFactory.AccountId, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            harness.UnitOfWork.Verify(u => u.TryRecordOriginDeparture(
+                TestFactory.TripId, T0.AddSeconds(31)), Times.Once);
+
+            // Timeline only, and never a Manager alert type: origin departure is measurement, not
+            // something anyone needs to be woken up for (§11).
+            harness.EventWriter.Verify(w => w.AppendAsync(
+                TestFactory.AccountId, TestFactory.TripId, null, TripEventTypes.TripOriginDeparted,
+                T0.AddSeconds(31), TripEventSources.Detection, null,
+                $"trip-origin-depart:{TestFactory.TripId:N}", It.IsAny<CancellationToken>()), Times.Once);
+        });
+    }
+
+    [Test]
+    public async Task OriginDeparture_ClockResetsWhenTheUnitComesBackInside()
+    {
+        var harness = new DetectionHarness(hasOriginGeom: true, armedAt: T0.AddHours(-1));
+        harness.StopsContainingPoint();
+        var service = harness.Service();
+
+        harness.InsideOrigin = false;
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        // Rolled back into the yard: the debounce starts over, so the 31-second-later fix below is
+        // only 1 second into a NEW window.
+        harness.InsideOrigin = true;
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(4.65, -74.05, T0.AddSeconds(30))], TestFactory.AccountId, CancellationToken.None);
+
+        harness.InsideOrigin = false;
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0.AddSeconds(31))], TestFactory.AccountId, CancellationToken.None);
+
+        harness.UnitOfWork.Verify(u => u.TryRecordOriginDeparture(
+            It.IsAny<Guid>(), It.IsAny<DateTimeOffset>()), Times.Never);
+    }
+
+    /// <summary>
+    /// A round trip's return stop IS the origin. Without this suppression the very fix that starts
+    /// the trip also "arrives" at the return stop, and the route reads as complete before the truck
+    /// has moved.
+    /// </summary>
+    [Test]
+    public async Task AStopSharingTheOriginZone_DoesNotArriveBeforeTheTripLeaves()
+    {
+        var harness = new DetectionHarness(hasOriginGeom: true, armedAt: T0.AddHours(-1));
+        harness.StopsContainingPoint(TestFactory.StopId);
+        harness.InsideOrigin = true;
+
+        var result = await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(4.65, -74.05, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        Assert.That(result.StopsArrived, Is.Zero);
+    }
+
+    [Test]
+    public async Task TheReturnStop_ArrivesNormallyOnceTheTripHasLeftItsOrigin()
+    {
+        // The complement of the test above: the suppression is gated on the trip not having departed
+        // its origin, so the genuine return at the END of the round trip still detects.
+        var harness = new DetectionHarness(
+            hasOriginGeom: true, armedAt: T0.AddHours(-1), originDepartedAt: T0.AddHours(-1));
+        harness.StopsContainingPoint(TestFactory.StopId);
+        harness.InsideOrigin = true;
+
+        var result = await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(4.65, -74.05, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        Assert.That(result.StopsArrived, Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task ClosingTheLastStop_AsksAutoCompletionToCloseTheTrip()
+    {
+        var harness = new DetectionHarness([TestFactory.OpenStop(TestFactory.StopId, TripStopStatuses.Arrived)]);
+        harness.StopsContainingPoint();
+        var service = harness.Service();
+
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0)], TestFactory.AccountId, CancellationToken.None);
+        await service.ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0.AddSeconds(31))], TestFactory.AccountId, CancellationToken.None);
+
+        harness.AutoCompletion.Verify(s => s.TryCompleteAsync(
+            TestFactory.AccountId, TestFactory.TripId, T0.AddSeconds(31),
+            TripAccountConfigVm.DefaultFinalStopCompletionMinutes, It.IsAny<CancellationToken>()), Times.AtLeastOnce);
+    }
+
+    /// <summary>
+    /// The depot case, and the reason completion is NOT gated on "a stop just closed": a truck that
+    /// arrives home and parks never departs its final stop, so no departure ever fires — but it
+    /// keeps reporting, and the dwell rule has to be asked on those fixes. Gated on a stop closing,
+    /// this trip would have waited for the sweep, which exists for the opposite case (§5.2).
+    /// </summary>
+    [Test]
+    public async Task AParkedTruckAtItsArrivedFinalStop_IsStillOfferedForCompletion()
+    {
+        var harness = new DetectionHarness([TestFactory.OpenStop(TestFactory.StopId, TripStopStatuses.Arrived)]);
+        harness.StopsContainingPoint(TestFactory.StopId);
+
+        // Sitting inside the stop's geometry: nothing arrives, nothing departs.
+        await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(4.7, -74.0, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        harness.AutoCompletion.Verify(s => s.TryCompleteAsync(
+            TestFactory.AccountId, TestFactory.TripId, T0,
+            TripAccountConfigVm.DefaultFinalStopCompletionMinutes, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Test]
+    public async Task ATripWithAPendingStop_IsNeverOfferedForCompletion()
+    {
+        var harness = new DetectionHarness([
+            TestFactory.OpenStop(TestFactory.StopId, TripStopStatuses.Arrived),
+            TestFactory.OpenStop(Guid.NewGuid(), TripStopStatuses.Pending, sequence: 2)]);
+        harness.StopsContainingPoint();
+
+        await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        harness.AutoCompletion.Verify(s => s.TryCompleteAsync(
+            It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<DateTimeOffset>(), It.IsAny<int>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    /// <summary>
+    /// A trip closed earlier in the same batch must stop accruing. The odometer writer has no status
+    /// guard of its own, so without this a caller that sends several fixes for one transporter would
+    /// keep pushing distance onto a completed trip.
+    /// </summary>
+    [Test]
+    public async Task OnceATripCompletesMidBatch_LaterFixesDoNotTouchIt()
+    {
+        var harness = new DetectionHarness([TestFactory.OpenStop(TestFactory.StopId, TripStopStatuses.Departed)]);
+        harness.StopsContainingPoint();
+        harness.AutoCompletion
+            .Setup(s => s.TryCompleteAsync(
+                It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<DateTimeOffset>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(5.0, -74.5, T0), TestFactory.Position(5.1, -74.6, T0.AddMinutes(1))],
+            TestFactory.AccountId, CancellationToken.None);
+
+        // The first fix ran the pipeline and completed the trip; the second must not.
+        harness.UnitOfWork.Verify(u => u.TryAdvanceProgress(
+            It.IsAny<Guid>(), It.IsAny<double>(), It.IsAny<double>(),
+            It.IsAny<DateTimeOffset>(), It.IsAny<double>()), Times.Once);
+    }
+
+    /// <summary>
+    /// The account kill switch (§8). With <c>autoLifecycle</c> off the reader is asked for
+    /// <c>InProgress</c> trips only — no arming window at all — so a fleet without reliable GPS runs
+    /// the manual flow exactly as it did before zero-touch.
+    /// </summary>
+    [Test]
+    public async Task AutoLifecycleOff_AsksForNoArmableTrips()
+    {
+        var harness = new DetectionHarness();
+        harness.Config = TripAccountConfigVm.Default with { AutoLifecycle = false };
+        harness.StopsContainingPoint();
+
+        await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(4.7, -74.0, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        harness.UnitOfWork.Verify(u => u.LoadAsync(
+            TestFactory.AccountId,
+            It.IsAny<IReadOnlyCollection<Guid>>(),
+            It.Is<DateTimeOffset?>(until => !until.HasValue),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Test]
+    public async Task AutoLifecycleOn_OffersTheActivationWindowToTheReader()
+    {
+        var harness = new DetectionHarness();
+        harness.StopsContainingPoint();
+
+        await harness.Service().ProcessPositionsAsync(
+            [TestFactory.Position(4.7, -74.0, T0)], TestFactory.AccountId, CancellationToken.None);
+
+        harness.UnitOfWork.Verify(u => u.LoadAsync(
+            TestFactory.AccountId,
+            It.IsAny<IReadOnlyCollection<Guid>>(),
+            It.Is<DateTimeOffset?>(until => until.HasValue),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     /// <summary>
     /// A stand-in for the trip/stop rows. Every write the service makes lands here and every
-    /// <c>GetOpenTripsAsync</c> re-reads it, so state genuinely has to be PERSISTED to survive a
+    /// <c>LoadAsync</c> re-reads it, so state genuinely has to be PERSISTED to survive a
     /// call — the harness cannot be satisfied by per-request memory.
     /// </summary>
     private sealed class DetectionHarness
@@ -616,6 +911,12 @@ public class TripDetectionServiceTests
         private double? lastLatitude;
         private double? lastLongitude;
         private double actualDistanceMeters;
+        private string status;
+        private DateTimeOffset? armedAt;
+        private bool hasOriginGeom;
+        private DateTimeOffset? originArrivedAt;
+        private DateTimeOffset? originDepartedAt;
+        private DateTimeOffset? originOutsideSinceAt;
 
         public DetectionHarness(
             IReadOnlyCollection<OpenTripStopVm>? stops = null,
@@ -625,7 +926,13 @@ public class TripDetectionServiceTests
             int consecutiveOutsideFixes = 0,
             double? lastLatitude = null,
             double? lastLongitude = null,
-            DateTimeOffset? lastPositionAt = null)
+            DateTimeOffset? lastPositionAt = null,
+            string status = TripStatuses.InProgress,
+            DateTimeOffset? armedAt = null,
+            bool hasOriginGeom = false,
+            DateTimeOffset? originArrivedAt = null,
+            DateTimeOffset? originDepartedAt = null,
+            DateTimeOffset? originOutsideSinceAt = null)
         {
             this.stops = [.. stops ?? [TestFactory.OpenStop(TestFactory.StopId)]];
             this.hasReadyPlan = hasReadyPlan;
@@ -634,14 +941,87 @@ public class TripDetectionServiceTests
             this.lastLatitude = lastLatitude;
             this.lastLongitude = lastLongitude;
             this.lastPositionAt = lastPositionAt;
+            this.status = status;
+            this.armedAt = armedAt;
+            this.hasOriginGeom = hasOriginGeom;
+            this.originArrivedAt = originArrivedAt;
+            this.originDepartedAt = originDepartedAt;
+            this.originOutsideSinceAt = originOutsideSinceAt;
             fixedTrips = openTrips;
 
-            DetectionReader
-                .Setup(r => r.GetOpenTripsAsync(TestFactory.AccountId, It.IsAny<IReadOnlyCollection<Guid>>(), It.IsAny<CancellationToken>()))
+            UnitOfWork
+                .Setup(u => u.LoadAsync(
+                    TestFactory.AccountId, It.IsAny<IReadOnlyCollection<Guid>>(), It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(CurrentTrips);
             DetectionReader
                 .Setup(r => r.IsInsideCorridorAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<double>(), It.IsAny<double>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(() => InsideCorridor);
+            UnitOfWork
+                .Setup(u => u.IsInsideOrigin(It.IsAny<Guid>(), It.IsAny<double>(), It.IsAny<double>()))
+                .Returns(() => InsideOrigin);
+
+            AccountFeatureReader
+                .Setup(r => r.GetAccountConfigAsync(It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() => Config);
+
+            // The real writer freezes the geometry and stamps ArmedAt; the harness models both, so a
+            // trip armed on one fix is genuinely armable-no-more on the next.
+            UnitOfWork
+                .Setup(u => u.ArmAsync(It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() =>
+                {
+                    if (this.armedAt.HasValue)
+                    {
+                        return false;
+                    }
+
+                    this.armedAt = DateTimeOffset.UtcNow;
+                    this.hasOriginGeom = true;
+                    return true;
+                });
+
+            TripWriter
+                .Setup(w => w.TransitionTripAsync(
+                    It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                    It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<bool>(),
+                    It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((Guid _, Guid _, string toStatus, string _, string _, string _, string? _, string? _,
+                    bool _, DateTimeOffset? _, CancellationToken _) =>
+                {
+                    if (!TransitionResult)
+                    {
+                        return false;
+                    }
+
+                    this.status = toStatus;
+                    return true;
+                });
+
+            UnitOfWork
+                .Setup(u => u.RecordOriginVisit(It.IsAny<Guid>(), It.IsAny<DateTimeOffset?>(), It.IsAny<DateTimeOffset?>()))
+                .Callback((Guid _, DateTimeOffset? arrivedAt, DateTimeOffset? departedAt) =>
+                {
+                    this.originArrivedAt ??= arrivedAt;
+                    this.originDepartedAt ??= departedAt;
+                });
+
+            UnitOfWork
+                .Setup(u => u.TryRecordOriginDeparture(It.IsAny<Guid>(), It.IsAny<DateTimeOffset>()))
+                .Returns((Guid _, DateTimeOffset departedAt) =>
+                {
+                    if (this.originDepartedAt.HasValue)
+                    {
+                        return false;
+                    }
+
+                    this.originDepartedAt = departedAt;
+                    this.originOutsideSinceAt = null;
+                    return true;
+                });
+
+            UnitOfWork
+                .Setup(u => u.SetOriginOutsideSince(It.IsAny<Guid>(), It.IsAny<DateTimeOffset?>()))
+                .Callback((Guid _, DateTimeOffset? outsideSinceAt) => this.originOutsideSinceAt = outsideSinceAt);
 
             StopWriter
                 .Setup(w => w.RecordStopProgressAsync(
@@ -668,11 +1048,10 @@ public class TripDetectionServiceTests
             // fix whose timestamp is not newer than the last accepted one is rejected, and the
             // service must then skip detection for it entirely. A harness that always accepted
             // would hide exactly the replay defect this models.
-            TripWriter
-                .Setup(w => w.UpdateTripProgressAsync(
-                    It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<double>(), It.IsAny<double>(),
-                    It.IsAny<DateTimeOffset>(), It.IsAny<double>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync((Guid _, Guid _, double latitude, double longitude, DateTimeOffset positionAt, double added, CancellationToken _) =>
+            UnitOfWork
+                .Setup(u => u.TryAdvanceProgress(
+                    It.IsAny<Guid>(), It.IsAny<double>(), It.IsAny<double>(), It.IsAny<DateTimeOffset>(), It.IsAny<double>()))
+                .Returns((Guid _, double latitude, double longitude, DateTimeOffset positionAt, double added) =>
                 {
                     // `this.` is load-bearing: the constructor's seed parameters share these names,
                     // and an unqualified assignment would write the parameter, leaving the harness
@@ -693,15 +1072,13 @@ public class TripDetectionServiceTests
                     return true;
                 });
 
-            TripWriter
-                .Setup(w => w.SetDeviationStateAsync(
-                    It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<DateTimeOffset?>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
-                .Callback((Guid _, Guid _, DateTimeOffset? openedAt, int fixes, CancellationToken _) =>
+            UnitOfWork
+                .Setup(u => u.SetDeviationState(It.IsAny<Guid>(), It.IsAny<DateTimeOffset?>(), It.IsAny<int>()))
+                .Callback((Guid _, DateTimeOffset? openedAt, int fixes) =>
                 {
                     this.deviationOpenedAt = openedAt;
                     this.consecutiveOutsideFixes = fixes;
-                })
-                .Returns(Task.CompletedTask);
+                });
 
             EventWriter
                 .Setup(w => w.AppendAsync(
@@ -728,6 +1105,14 @@ public class TripDetectionServiceTests
         /// </summary>
         public bool? InsideCorridor { get; set; } = true;
 
+        /// <summary>Whether the fix being processed falls inside the trip's snapshotted origin zone.</summary>
+        public bool InsideOrigin { get; set; }
+
+        /// <summary>What the funnel answers — false models a lost race or a duplicate transition.</summary>
+        public bool TransitionResult { get; set; } = true;
+
+        public TripAccountConfigVm Config { get; set; } = TripAccountConfigVm.Default;
+
         public bool RecordResult { get; set; } = true;
 
         /// <summary>Every <c>addedDistanceMeters</c> the service handed the writer, in order.</summary>
@@ -743,26 +1128,36 @@ public class TripDetectionServiceTests
 
         public Mock<ITripWriter> TripWriter { get; } = new();
 
+        /// <summary>
+        /// The detection working set. It replaced six writer calls per fix with a load-once,
+        /// commit-once unit, so the harness models the unit rather than the writers it retired.
+        /// </summary>
+        public Mock<ITripDetectionUnitOfWork> UnitOfWork { get; } = new();
+
         public Mock<ITripStopWriter> StopWriter { get; } = new();
 
         public Mock<ITripEventWriter> EventWriter { get; } = new();
 
         public Mock<IAlertEmitter> AlertEmitter { get; } = new();
 
+        public Mock<IAccountFeatureReader> AccountFeatureReader { get; } = new();
+
+        public Mock<ITripAutoCompletionService> AutoCompletion { get; } = new();
+
         public void StopsContainingPoint(params Guid[] stopIds)
-            => DetectionReader
-                .Setup(r => r.GetStopsContainingPointAsync(
-                    It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<double>(), It.IsAny<double>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync(stopIds);
+            => UnitOfWork
+                .Setup(u => u.StopsContainingPoint(It.IsAny<Guid>(), It.IsAny<double>(), It.IsAny<double>()))
+                .Returns(stopIds);
 
         public TripDetectionService Service()
-            => new(DetectionReader.Object, TripWriter.Object, StopWriter.Object, EventWriter.Object,
-                AlertEmitter.Object, TestFactory.Logger<TripDetectionService>());
+            => new(DetectionReader.Object, UnitOfWork.Object, AccountFeatureReader.Object, TripWriter.Object, StopWriter.Object,
+                EventWriter.Object, AutoCompletion.Object, AlertEmitter.Object, TestFactory.Logger<TripDetectionService>());
 
         private IReadOnlyCollection<OpenTripVm> CurrentTrips()
             => fixedTrips ?? [TestFactory.OpenTrip(
                 [.. stops], hasReadyPlan, deviationOpenedAt, consecutiveOutsideFixes,
-                actualDistanceMeters, lastLatitude, lastLongitude, lastPositionAt)];
+                actualDistanceMeters, lastLatitude, lastLongitude, lastPositionAt,
+                status, null, armedAt, hasOriginGeom, originArrivedAt, originDepartedAt, originOutsideSinceAt)];
 
         private void Mutate(Guid stopId, Func<OpenTripStopVm, OpenTripStopVm> change)
         {

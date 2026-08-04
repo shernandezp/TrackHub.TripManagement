@@ -39,7 +39,11 @@ public static class TripStatuses
     {
         [Created] = new HashSet<string>(StringComparer.Ordinal) { InProgress, Cancelled },
         [InProgress] = new HashSet<string>(StringComparer.Ordinal) { Paused, Completed, Aborted, Cancelled },
-        [Paused] = new HashSet<string>(StringComparer.Ordinal) { InProgress, Cancelled, Aborted },
+
+        // Paused → Completed is a manual-only edge (spec 11a §5.1). Without it a dispatcher who
+        // took control of a finished trip had to Resume it — briefly handing it back to automation —
+        // purely so they could close it.
+        [Paused] = new HashSet<string>(StringComparer.Ordinal) { InProgress, Completed, Cancelled, Aborted },
         [Completed] = new HashSet<string>(StringComparer.Ordinal),
         [Cancelled] = new HashSet<string>(StringComparer.Ordinal),
         [Aborted] = new HashSet<string>(StringComparer.Ordinal),
@@ -83,6 +87,69 @@ public static class TripStopStatuses
     public static bool IsClosed(string status)
         => string.Equals(status, Departed, StringComparison.Ordinal)
         || string.Equals(status, Skipped, StringComparison.Ordinal);
+}
+
+/// <summary>
+/// The zone radii this module accepts. Shared by the origin and by every stop on purpose — a trip's
+/// ends are measured exactly the way its middle is (spec 11a §4.1).
+/// </summary>
+public static class TripGeometry
+{
+    public const int DefaultRadiusMeters = 150;
+    public const int MinRadiusMeters = 50;
+    public const int MaxRadiusMeters = 5000;
+
+    /// <summary>Clamps operator- or partner-supplied radii into the accepted band.</summary>
+    public static int NormalizeRadius(int radiusMeters)
+        => radiusMeters < MinRadiusMeters || radiusMeters > MaxRadiusMeters
+            ? DefaultRadiusMeters
+            : radiusMeters;
+}
+
+/// <summary>
+/// What a stop is FOR. Dwell without this is an anonymous number of minutes; with it the same
+/// measurement reads as loading time or unloading time in the reports (spec 11a §4.2).
+/// </summary>
+public static class TripStopActivities
+{
+    public const string Load = nameof(Load);
+    public const string Unload = nameof(Unload);
+    public const string Other = nameof(Other);
+
+    public static readonly IReadOnlyCollection<string> All = [Load, Unload, Other];
+
+    public static bool IsValid(string? value) => value != null && All.Contains(value);
+
+    /// <summary>
+    /// Normalizes free-form input (CSV column, partner payload) to a catalog value, defaulting to
+    /// <see cref="Unload"/> — the overwhelmingly common case for a delivery stop.
+    /// </summary>
+    public static string Normalize(string? value)
+        => All.FirstOrDefault(a => string.Equals(a, value?.Trim(), StringComparison.OrdinalIgnoreCase)) ?? Unload;
+}
+
+/// <summary>
+/// The live phase of a trip, DERIVED server-side from status plus the measured origin and stop
+/// timestamps (spec 11a §4.3). Never stored: it is a reading of the recorded facts, and a stored
+/// copy would be one more thing that can disagree with them.
+/// </summary>
+public static class TripPhases
+{
+    public const string Scheduled = nameof(Scheduled);
+    public const string Armed = nameof(Armed);
+    public const string AtOrigin = nameof(AtOrigin);
+    public const string InTransit = nameof(InTransit);
+    public const string AtStop = nameof(AtStop);
+    public const string Overdue = nameof(Overdue);
+    public const string Paused = nameof(Paused);
+    public const string Completed = nameof(Completed);
+    public const string Cancelled = nameof(Cancelled);
+    public const string Aborted = nameof(Aborted);
+
+    public static readonly IReadOnlyCollection<string> All =
+        [Scheduled, Armed, AtOrigin, InTransit, AtStop, Overdue, Paused, Completed, Cancelled, Aborted];
+
+    public static bool IsValid(string? value) => value != null && All.Contains(value);
 }
 
 public static class DeliveryStatuses
@@ -201,6 +268,15 @@ public static class TripEventTypes
     public const string TripStarted = nameof(TripStarted);
     public const string TripPaused = nameof(TripPaused);
     public const string TripResumed = nameof(TripResumed);
+    /// <summary>
+    /// The vehicle left the origin zone: loading ended, transit began.
+    /// <para>
+    /// TIMELINE-ONLY. Deliberately NOT mirrored in Manager's <c>AlertEventTypes</c> — it is a
+    /// measurement, not something anyone needs to be woken up for, and adding it would put a new
+    /// literal on the wire for no subscriber (spec 11a §11).
+    /// </para>
+    /// </summary>
+    public const string TripOriginDeparted = nameof(TripOriginDeparted);
     public const string TripStopArrived = nameof(TripStopArrived);
     public const string TripStopDeparted = nameof(TripStopDeparted);
     public const string TripStopSkipped = nameof(TripStopSkipped);
@@ -218,6 +294,23 @@ public static class TripEventTypes
     public const string TripStartDue = nameof(TripStartDue);
     public const string TollStationChanged = nameof(TollStationChanged);
     public const string TollTariffChanged = nameof(TollTariffChanged);
+
+    /// <summary>
+    /// The timeline event a status transition produces. <c>Created → InProgress</c> is a start and
+    /// <c>Paused → InProgress</c> is a resume — the same destination status, two different things
+    /// that happened, which is why the ORIGIN matters here.
+    /// </summary>
+    public static string ForTransition(string fromStatus, string toStatus) => toStatus switch
+    {
+        TripStatuses.InProgress => string.Equals(fromStatus, TripStatuses.Created, StringComparison.Ordinal)
+            ? TripStarted
+            : TripResumed,
+        TripStatuses.Paused => TripPaused,
+        TripStatuses.Completed => TripCompleted,
+        TripStatuses.Cancelled => TripCancelled,
+        TripStatuses.Aborted => TripAborted,
+        _ => TripUpdated,
+    };
 }
 
 public static class TripDocumentKinds
@@ -251,6 +344,24 @@ public static class TripErrorCodes
     public const string DuplicateTripCode = "TRIP_DUPLICATE_CODE";
     public const string DuplicateExternalReference = "TRIP_DUPLICATE_EXTERNAL_REFERENCE";
     public const string TripHasHistory = "TRIP_HAS_HISTORY";
+
+    /// <summary>
+    /// The transporter is already running another trip. One physical unit runs one trip at a time,
+    /// enforced by <c>ux_trips_transporterid_inprogress</c> (spec 11a §4.1).
+    /// </summary>
+    public const string TransporterBusy = "TRIP_TRANSPORTER_BUSY";
+
+    /// <summary>
+    /// The trip is armed — detection is watching it — so its transporter and origin are frozen.
+    /// Re-pointing a watched trip mid-decision changes what the running measurement means (§12.4).
+    /// </summary>
+    public const string TripArmed = "TRIP_ARMED";
+
+    /// <summary>
+    /// An "already in transit" trip was declared without a start time and no recorded visit could be
+    /// found to back-fill from, so there is nothing honest to stamp <c>ActualStartAt</c> with (§5.4).
+    /// </summary>
+    public const string StartEvidenceRequired = "TRIP_START_EVIDENCE_REQUIRED";
     public const string DriverNotAssignable = "TRIP_DRIVER_NOT_ASSIGNABLE";
     public const string RoutingNotConfigured = "ROUTING_NOT_CONFIGURED";
     public const string RoutingUnavailable = "ROUTING_UNAVAILABLE";

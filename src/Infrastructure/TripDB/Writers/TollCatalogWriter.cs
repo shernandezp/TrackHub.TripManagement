@@ -48,10 +48,10 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
     public async Task UpdateVehicleClassAsync(Guid tollVehicleClassId, TollVehicleClassDto vehicleClass, CancellationToken cancellationToken)
     {
         var entity = await context.TollVehicleClasses
+            .AsTracking()
             .FirstOrDefaultAsync(c => c.TollVehicleClassId == tollVehicleClassId, cancellationToken)
             ?? throw new NotFoundException($"{tollVehicleClassId}", nameof(TollVehicleClass));
 
-        context.TollVehicleClasses.Attach(entity);
         entity.Code = vehicleClass.Code;
         entity.Name = vehicleClass.Name;
         entity.Description = vehicleClass.Description;
@@ -65,11 +65,11 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
     public async Task DeactivateVehicleClassAsync(Guid tollVehicleClassId, CancellationToken cancellationToken)
     {
         var entity = await context.TollVehicleClasses
+            .AsTracking()
             .FirstOrDefaultAsync(c => c.TollVehicleClassId == tollVehicleClassId, cancellationToken)
             ?? throw new NotFoundException($"{tollVehicleClassId}", nameof(TollVehicleClass));
 
         // Deactivated, never deleted: historical estimates reference the class by code.
-        context.TollVehicleClasses.Attach(entity);
         entity.Active = false;
         AddAuditEvent("DeactivateTollVehicleClass", entity.TollVehicleClassId);
         await context.SaveChangesAsync(cancellationToken);
@@ -103,7 +103,6 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
     {
         var entity = await FindStationAsync(tollStationId, cancellationToken);
 
-        context.TollStations.Attach(entity);
         entity.Name = station.Name;
         entity.Code = station.Code;
         entity.Point = TripGeometryFactory.Point(station.Latitude, station.Longitude);
@@ -123,7 +122,6 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
     {
         var entity = await FindStationAsync(tollStationId, cancellationToken);
 
-        context.TollStations.Attach(entity);
         entity.Active = false;
         entity.AddDomainEvent(new TollCatalogDomainEvent(TripEventTypes.TollStationChanged, entity.TollStationId, entity.Code));
         AddAuditEvent("DeactivateTollStation", entity.TollStationId);
@@ -161,7 +159,6 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
 
             // CLOSE, never overwrite: the old price stays queryable so a historical trip's
             // estimate remains reproducible (acceptance 21).
-            context.TollTariffs.Attach(open);
             open.EffectiveTo = tariff.EffectiveFrom.AddDays(-1);
         }
 
@@ -188,6 +185,7 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
     public async Task UpdateTariffAsync(Guid tollTariffId, TollTariffDto tariff, CancellationToken cancellationToken)
     {
         var entity = await context.TollTariffs
+            .AsTracking()
             .FirstOrDefaultAsync(t => t.TollTariffId == tollTariffId, cancellationToken)
             ?? throw new NotFoundException($"{tollTariffId}", nameof(TollTariff));
 
@@ -204,7 +202,6 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
             throw ConflictException.WithCode(TripErrorCodes.OverlappingTariff);
         }
 
-        context.TollTariffs.Attach(entity);
         entity.TollVehicleClassCode = tariff.TollVehicleClassCode;
         entity.Amount = tariff.Amount;
         entity.Currency = tariff.Currency;
@@ -220,10 +217,10 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
     public async Task DeleteTariffAsync(Guid tollTariffId, CancellationToken cancellationToken)
     {
         var entity = await context.TollTariffs
+            .AsTracking()
             .FirstOrDefaultAsync(t => t.TollTariffId == tollTariffId, cancellationToken)
             ?? throw new NotFoundException($"{tollTariffId}", nameof(TollTariff));
 
-        context.TollTariffs.Attach(entity);
         entity.AddDomainEvent(new TollCatalogDomainEvent(
             TripEventTypes.TollTariffChanged, entity.TollTariffId, entity.TollVehicleClassCode));
         AddAuditEvent("DeleteTollTariff", entity.TollTariffId);
@@ -311,12 +308,11 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
     {
         // Upsert by station code when supplied, otherwise by name + coordinates (spec 11 7.6).
         var existing = string.IsNullOrWhiteSpace(row.StationCode)
-            ? await context.TollStations.FirstOrDefaultAsync(s => s.Name == row.StationName, cancellationToken)
-            : await context.TollStations.FirstOrDefaultAsync(s => s.Code == row.StationCode, cancellationToken);
+            ? await context.TollStations.AsTracking().FirstOrDefaultAsync(s => s.Name == row.StationName, cancellationToken)
+            : await context.TollStations.AsTracking().FirstOrDefaultAsync(s => s.Code == row.StationCode, cancellationToken);
 
         if (existing is not null)
         {
-            context.TollStations.Attach(existing);
             existing.Name = row.StationName!;
             existing.Point = TripGeometryFactory.Point(row.Latitude!.Value, row.Longitude!.Value);
             existing.Country = row.Country ?? existing.Country;
@@ -345,14 +341,14 @@ public sealed class TollCatalogWriter(IApplicationDbContext context, ITollCatalo
     }
 
     private async Task<TollTariff?> OpenTariffAsync(Guid tollStationId, string vehicleClassCode, CancellationToken cancellationToken)
-        => await context.TollTariffs.FirstOrDefaultAsync(
+        => await context.TollTariffs.AsTracking().FirstOrDefaultAsync(
             t => t.TollStationId == tollStationId
                 && t.TollVehicleClassCode == vehicleClassCode
                 && t.EffectiveTo == null,
             cancellationToken);
 
     private async Task<TollStation> FindStationAsync(Guid tollStationId, CancellationToken cancellationToken)
-        => await context.TollStations.FirstOrDefaultAsync(s => s.TollStationId == tollStationId, cancellationToken)
+        => await context.TollStations.AsTracking().FirstOrDefaultAsync(s => s.TollStationId == tollStationId, cancellationToken)
             ?? throw new NotFoundException($"{tollStationId}", nameof(TollStation));
 
     /// <summary>

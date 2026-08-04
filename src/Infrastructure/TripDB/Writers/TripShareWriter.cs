@@ -60,10 +60,9 @@ public sealed class TripShareWriter(IApplicationDbContext context) : ITripShareW
     public async Task<Guid> RevokeShareAsync(Guid tripShareId, Guid accountId, CancellationToken cancellationToken)
     {
         var entity = await context.TripShares
+            .AsTracking()
             .FirstOrDefaultAsync(s => s.TripShareId == tripShareId && s.AccountId == accountId, cancellationToken)
             ?? throw new NotFoundException($"{tripShareId}", nameof(TripShare));
-
-        context.TripShares.Attach(entity);
 
         // Idempotent: re-revoking keeps the first revocation instant.
         entity.RevokedAt ??= DateTimeOffset.UtcNow;

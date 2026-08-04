@@ -33,8 +33,30 @@ internal static class TripMapper
 {
     internal static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
-    internal static TripVm ToVm(Trip trip, int stopCount)
-        => new(
+    /// <summary>
+    /// <paramref name="phaseStops"/> is what the phase is read from. It is optional so the paths
+    /// that genuinely have no stop context (a freshly created trip returned by its own writer) still
+    /// map — an empty list yields a phase derived from status and the origin timestamps alone, which
+    /// is exactly right for a trip that has no route yet.
+    /// </summary>
+    internal static TripVm ToVm(
+        Trip trip,
+        int stopCount,
+        IReadOnlyCollection<PhaseStopVm>? phaseStops = null,
+        int overdueGraceMinutes = TripAccountConfigVm.DefaultOverdueGraceMinutes)
+    {
+        var phase = TripPhaseResolver.Resolve(
+            trip.Status,
+            trip.PlannedStartAt,
+            trip.ArmedAt,
+            trip.OriginArrivedAt,
+            trip.OriginDepartedAt,
+            trip.OriginName,
+            phaseStops ?? [],
+            DateTimeOffset.UtcNow,
+            overdueGraceMinutes);
+
+        return new TripVm(
             trip.TripId,
             trip.AccountId,
             trip.Code,
@@ -48,10 +70,20 @@ internal static class TripMapper
             trip.OriginName,
             trip.OriginPoint.Y,
             trip.OriginPoint.X,
+            trip.OriginGeofenceId,
+            trip.OriginRadiusMeters,
             trip.PlannedStartAt,
             trip.PlannedEndAt,
             trip.ActualStartAt,
             trip.ActualEndAt,
+            trip.ArmedAt,
+            trip.OriginArrivedAt,
+            trip.OriginDepartedAt,
+            phase.Phase,
+            phase.PhaseStopName,
+            phase.PhaseStopActivity,
+            phase.PhaseEtaAt,
+            phase.PhaseDelayed,
             trip.Notes,
             trip.LastPositionAt,
             trip.LastPoint?.Y,
@@ -61,7 +93,9 @@ internal static class TripMapper
             trip.DeviationOpenedAt,
             trip.CancellationReason,
             stopCount,
+            phaseStops?.Count(s => string.Equals(s.Status, TripStopStatuses.Pending, StringComparison.Ordinal)) ?? 0,
             trip.LastModified);
+    }
 
     internal static TripStopVm ToVm(TripStop stop, IReadOnlyCollection<DeliveryVm> deliveries)
         => new(
@@ -76,6 +110,7 @@ internal static class TripMapper
             stop.Point.X,
             stop.GeofenceId,
             stop.ArrivalRadiusMeters,
+            stop.Activity,
             stop.PlannedArrivalFrom,
             stop.PlannedArrivalTo,
             stop.Status,

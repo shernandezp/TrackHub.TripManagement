@@ -62,10 +62,18 @@ public sealed class UpdateDeliveryOutcomeCommandHandler(
         await TripVisibility.ResolveVisibleTripByDeliveryAsync(
             reader, request.DeliveryId, caller.AccountId, scopeUserId, cancellationToken);
 
-        if (TripStatuses.IsTerminal(trip.Status))
-            throw TripValidationFailure.Create(nameof(UpdateDeliveryOutcomeCommand.TripId), TripErrorCodes.TripAlreadyTerminal);
-
         var idempotencyKey = $"trip-delivery-outcome:{request.DeliveryId:N}:{request.ClientEventId:N}";
+
+        // Idempotency BEFORE the terminal guard (acceptance 15), for the same reason as POD and stop
+        // progress: the trip closes behind the outcome, and a replay of an outcome the server already
+        // recorded must be a success the device can retire — not a permanent error it retries forever.
+        // A genuinely new outcome on a closed trip is still refused.
+        if (!await tripEventWriter.HasEventAsync(caller.AccountId, idempotencyKey, cancellationToken)
+            && TripStatuses.IsTerminal(trip.Status))
+        {
+            throw TripValidationFailure.Create(nameof(UpdateDeliveryOutcomeCommand.TripId), TripErrorCodes.TripAlreadyTerminal);
+        }
+
         var recorded = await writer.UpdateDeliveryOutcomeAsync(
             request.DeliveryId, caller.AccountId, request.Status, request.Observations, idempotencyKey, cancellationToken);
 

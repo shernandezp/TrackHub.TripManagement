@@ -65,7 +65,18 @@ public sealed class RecordProofOfDeliveryCommandHandler(
         var scopeUserId = TripVisibility.ResolveScopeUserId(user, UserId);
         var trip = await reader.GetTripAsync(request.TripId, caller.AccountId, scopeUserId, cancellationToken);
 
-        if (TripStatuses.IsTerminal(trip.Status))
+        // Idempotency BEFORE the terminal guard (acceptance 15). A POD is the last thing recorded at
+        // a stop and the trip closes right behind it — auto-completion fires the moment that stop
+        // closes (§5.2) — so by the time an offline device re-sends, the trip is routinely terminal.
+        // Answering TRIP_ALREADY_TERMINAL to a submission the server already stored is a permanent
+        // failure the outbox can only retry forever.
+        //
+        // A genuinely NEW proof of delivery on a closed trip is still refused: only the replay of a
+        // submission already on file gets past this.
+        var replay = await writer.HasAsync(
+            caller.AccountId, request.ProofOfDelivery.TripStopId, request.ProofOfDelivery.ClientEventId, cancellationToken);
+
+        if (!replay && TripStatuses.IsTerminal(trip.Status))
             throw TripValidationFailure.Create(nameof(RecordProofOfDeliveryCommand.TripId), TripErrorCodes.TripAlreadyTerminal);
 
         foreach (var documentId in request.ProofOfDelivery.DocumentIds)

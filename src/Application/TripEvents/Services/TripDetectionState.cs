@@ -33,6 +33,36 @@ public sealed class TripDetectionState(OpenTripVm trip)
 
     public string Code { get; } = trip.Code;
 
+    /// <summary>
+    /// Mutable within the pass: a <c>Created</c> trip that auto-starts becomes <c>InProgress</c>
+    /// for every step that follows, in this fix and in the rest of the batch.
+    /// </summary>
+    public string Status { get; set; } = trip.Status;
+
+    public bool IsCreated => string.Equals(Status, TripStatuses.Created, StringComparison.Ordinal);
+
+    public bool IsInProgress => string.Equals(Status, TripStatuses.InProgress, StringComparison.Ordinal);
+
+    public DateTimeOffset PlannedStartAt { get; } = trip.PlannedStartAt;
+
+    public DateTimeOffset? ArmedAt { get; set; } = trip.ArmedAt;
+
+    /// <summary>
+    /// Whether the origin snapshot exists. Set by a successful arming, and false for every trip that
+    /// predates zero-touch — origin measurement simply never fires for those (§14).
+    /// </summary>
+    public bool HasOriginGeom { get; set; } = trip.HasOriginGeom;
+
+    public DateTimeOffset? OriginArrivedAt { get; set; } = trip.OriginArrivedAt;
+
+    public DateTimeOffset? OriginDepartedAt { get; set; } = trip.OriginDepartedAt;
+
+    /// <summary>Persisted origin exit-debounce clock, seeded from the column so the 30 s window spans calls.</summary>
+    public DateTimeOffset? OriginOutsideSince { get; set; } = trip.OriginOutsideSinceAt;
+
+    /// <summary>Whether the fix currently being processed falls inside the origin zone.</summary>
+    public bool InsideOrigin { get; set; }
+
     public Guid TransporterId { get; } = trip.TransporterId;
 
     public Guid? DriverId { get; } = trip.DriverId;

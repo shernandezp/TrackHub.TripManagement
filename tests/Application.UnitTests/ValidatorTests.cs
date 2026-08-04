@@ -145,9 +145,9 @@ public class ValidatorTests
     }
 
     private static TripDto Trip()
-        => new("TRIP-001", TestFactory.TransporterId, null, null, null, "ACME", "Depot", 4.65, -74.05,
+        => new("TRIP-001", TestFactory.TransporterId, null, null, null, "ACME", "Depot", 4.65, -74.05, null, TripGeometry.DefaultRadiusMeters,
             DateTimeOffset.UtcNow, null, null, null);
 
     private static TripStopDto Stop()
-        => new("Customer site", null, null, 4.7, -74.0, null, 150, null, null, false, 0, null);
+        => new("Customer site", null, null, 4.7, -74.0, null, 150, TripStopActivities.Unload, null, null, false, 0, null);
 }

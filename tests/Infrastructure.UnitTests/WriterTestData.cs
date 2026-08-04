@@ -14,6 +14,8 @@
 //
 
 using NetTopologySuite.Geometries;
+using TrackHub.TripManagement.Infrastructure.TripDB;
+using TrackHub.TripManagement.Infrastructure.TripDB.Writers;
 using TrackHub.TripManagement.Domain.Constants;
 using TrackHub.TripManagement.Infrastructure.TripDB.Entities;
 
@@ -23,6 +25,24 @@ namespace Infrastructure.UnitTests;
 internal static class WriterTestData
 {
     internal static readonly Guid AccountId = Guid.Parse("11111111-1111-1111-1111-111111111111");
+
+    internal static readonly Guid TransporterId = Guid.Parse("55555555-5555-5555-5555-555555555555");
+
+    /// <summary>
+    /// The detection unit of work, loaded the way detection loads it: one query for the working set,
+    /// then mutations against the rows already in hand. Tests go through <c>LoadAsync</c> first
+    /// because that is the only way production ever reaches those mutators — a fixture that skipped
+    /// it would be exercising a state the pipeline cannot produce.
+    /// </summary>
+    internal static async Task<TripDetectionUnitOfWork> LoadedUnitAsync(
+        ApplicationDbContext context, DateTimeOffset? armableUntil = null)
+    {
+        var unit = new TripDetectionUnitOfWork(
+            context, Microsoft.Extensions.Logging.Abstractions.NullLogger<TripDetectionUnitOfWork>.Instance);
+
+        await unit.LoadAsync(AccountId, [TransporterId], armableUntil, CancellationToken.None);
+        return unit;
+    }
 
     internal static Trip Trip(Guid tripId, string code)
         => new()

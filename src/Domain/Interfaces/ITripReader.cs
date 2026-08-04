@@ -97,6 +97,21 @@ public interface ITripReader
     /// </summary>
     Task<bool> GeofenceExistsInAccountAsync(Guid geofenceId, Guid accountId, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// The transporters this caller may plan for, by name — the resolution table a bulk upload
+    /// matches its <c>transporter</c> column against (spec 11a §9.1).
+    /// <para>
+    /// Group visibility applies exactly as it does everywhere else: a scoped dispatcher's upload
+    /// cannot name a vehicle they cannot see, and an unresolved name reports the same error whether
+    /// the vehicle is absent or merely invisible — a row must not become a way to enumerate another
+    /// group's fleet.
+    /// </para>
+    /// </summary>
+    Task<IReadOnlyCollection<NamedEntityVm>> GetTransporterNamesAsync(Guid accountId, Guid? userId, CancellationToken cancellationToken);
+
+    /// <summary>The account's active drivers by name, for the same resolution pass.</summary>
+    Task<IReadOnlyCollection<NamedEntityVm>> GetDriverNamesAsync(Guid accountId, CancellationToken cancellationToken);
+
     /// <summary>Paged export feed drained by Reporting at 500 rows a page.</summary>
     Task<TripsPageVm> GetReportDataAsync(
         Guid accountId,

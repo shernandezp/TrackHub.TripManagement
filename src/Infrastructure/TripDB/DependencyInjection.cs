@@ -58,6 +58,16 @@ public static class DependencyInjection
         services.AddScoped<IProofOfDeliveryWriter, ProofOfDeliveryWriter>();
         services.AddScoped<ITripDetectionReader, TripDetectionReader>();
 
+        // The detection working set as a unit of work: loaded once per batch, committed once per fix.
+        services.AddScoped<ITripDetectionUnitOfWork, TripDetectionUnitOfWork>();
+
+        // Geofencing's visit history, read-only (SVD-05): the evidence a late-created trip is
+        // rebuilt from (spec 11a §5.4).
+        services.AddScoped<IGeofenceVisitReader, GeofenceVisitReader>();
+
+        // The account's named places (geofences, then POIs), for bulk planning by name (§9.1).
+        services.AddScoped<IPlaceReader, PlaceReader>();
+
         // Route planning.
         services.AddScoped<IRoutePlanReader, RoutePlanReader>();
         services.AddScoped<IRoutePlanWriter, RoutePlanWriter>();

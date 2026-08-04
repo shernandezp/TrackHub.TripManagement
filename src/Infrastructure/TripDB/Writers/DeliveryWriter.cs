@@ -49,7 +49,6 @@ public sealed class DeliveryWriter(IApplicationDbContext context) : IDeliveryWri
     public async Task UpdateDeliveryAsync(Guid deliveryId, Guid accountId, DeliveryDto delivery, CancellationToken cancellationToken)
     {
         var entity = await FindAsync(deliveryId, accountId, cancellationToken);
-        context.Deliveries.Attach(entity);
 
         // Cross-stop moves are rejected by omission: TripStopId is never assignable here, a
         // delivery belongs to the stop it was created on.
@@ -90,7 +89,6 @@ public sealed class DeliveryWriter(IApplicationDbContext context) : IDeliveryWri
             IdempotencyKey = idempotencyKey,
         };
 
-        context.Deliveries.Attach(entity);
         entity.Status = status;
         if (!string.IsNullOrWhiteSpace(observations))
         {
@@ -120,7 +118,6 @@ public sealed class DeliveryWriter(IApplicationDbContext context) : IDeliveryWri
     public async Task DeleteDeliveryAsync(Guid deliveryId, Guid accountId, CancellationToken cancellationToken)
     {
         var entity = await FindAsync(deliveryId, accountId, cancellationToken);
-        context.Deliveries.Attach(entity);
         context.Deliveries.Remove(entity);
         await context.SaveChangesAsync(cancellationToken);
     }
@@ -128,6 +125,7 @@ public sealed class DeliveryWriter(IApplicationDbContext context) : IDeliveryWri
     public async Task MarkStopDeliveriesAsync(Guid tripStopId, Guid accountId, string status, CancellationToken cancellationToken)
     {
         var deliveries = await context.Deliveries
+            .AsTracking()
             .Where(d => d.TripStopId == tripStopId
                 && d.AccountId == accountId
                 && d.Status == DeliveryStatuses.Pending)
@@ -140,7 +138,6 @@ public sealed class DeliveryWriter(IApplicationDbContext context) : IDeliveryWri
 
         foreach (var delivery in deliveries)
         {
-            context.Deliveries.Attach(delivery);
             delivery.Status = status;
         }
 
@@ -148,6 +145,6 @@ public sealed class DeliveryWriter(IApplicationDbContext context) : IDeliveryWri
     }
 
     private async Task<Delivery> FindAsync(Guid deliveryId, Guid accountId, CancellationToken cancellationToken)
-        => await context.Deliveries.FirstOrDefaultAsync(d => d.DeliveryId == deliveryId && d.AccountId == accountId, cancellationToken)
+        => await context.Deliveries.AsTracking().FirstOrDefaultAsync(d => d.DeliveryId == deliveryId && d.AccountId == accountId, cancellationToken)
             ?? throw new NotFoundException($"{deliveryId}", nameof(Delivery));
 }

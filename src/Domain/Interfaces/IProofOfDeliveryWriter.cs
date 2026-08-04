@@ -39,4 +39,16 @@ public interface IProofOfDeliveryWriter
         Guid tripId,
         ProofOfDeliveryDto proofOfDelivery,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Whether this exact submission was already recorded — the <c>(TripStopId, ClientEventId)</c>
+    /// key acceptance 15 rests on.
+    /// <para>
+    /// Exposed so the handler can settle idempotency BEFORE its trip-state guard. A POD is delivery
+    /// evidence and the trip closes right behind it — auto-completion fires the moment the last stop
+    /// does (§5.2) — so a device re-sending a POD the server already has must be told yes, not
+    /// <c>TRIP_ALREADY_TERMINAL</c>, which spec 10's outbox can only retry forever.
+    /// </para>
+    /// </summary>
+    Task<bool> HasAsync(Guid accountId, Guid tripStopId, Guid clientEventId, CancellationToken cancellationToken);
 }

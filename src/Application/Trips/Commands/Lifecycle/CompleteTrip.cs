@@ -34,7 +34,6 @@ public readonly record struct CompleteTripCommand(Guid TripId, bool Force) : IRe
 public sealed class CompleteTripCommandHandler(
     ITripWriter writer,
     ITripReader reader,
-    ITripEventWriter tripEventWriter,
     IAlertEmitter alertEmitter,
     IUserReader userReader,
     IUser user,
@@ -57,11 +56,13 @@ public sealed class CompleteTripCommandHandler(
         }
 
         await TripLifecycleTransition.ExecuteAsync(
-            reader, writer, tripEventWriter, alertEmitter, logger,
+            reader, writer, alertEmitter, logger,
             request.TripId, caller.AccountId, TripVisibility.ResolveScopeUserId(user, UserId),
             TripStatuses.Completed, TripEventTypes.TripCompleted, TripAlertSeverities.Info,
+            TripEventSources.Portal,
             reason: request.Force ? "forced" : null, force: request.Force,
             $"trip-complete:{request.TripId:N}",
+            measuredAt: null,
             cancellationToken);
     }
 }

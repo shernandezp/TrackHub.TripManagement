@@ -66,8 +66,28 @@ public class BackgroundServiceCycleTests
 
         await harness.EtaService().RunOnceAsync(CancellationToken.None);
 
+        // The payload counts both kinds of work the cycle does — ETAs refreshed and trips closed by
+        // the auto-completion sweep, which shares this job key rather than adding one (spec 11a §5.2).
         harness.Recorder.Verify(r => r.RecordAsync(
-            BackgroundJobKeys.TripEtaRefresh, null, "7", It.IsAny<string>(), "Succeeded",
+            BackgroundJobKeys.TripEtaRefresh, null, "7/0", It.IsAny<string>(), "Succeeded",
+            It.IsAny<DateTimeOffset>(), It.IsAny<DateTimeOffset>(), null, null,
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    /// <summary>
+    /// The sweep alone counts as work. A cycle that refreshed no ETA but auto-completed a trip whose
+    /// tracker went dark has genuinely done something, and SVD-11's on-work-only rule must record it
+    /// — otherwise the one job that closes those trips leaves no trace it ever ran.
+    /// </summary>
+    [Test]
+    public async Task EtaRefresh_WithOnlyAnAutoCompletion_StillRecordsTheRun()
+    {
+        var harness = new CycleHarness(refreshed: 0, completed: 2);
+
+        await harness.EtaService().RunOnceAsync(CancellationToken.None);
+
+        harness.Recorder.Verify(r => r.RecordAsync(
+            BackgroundJobKeys.TripEtaRefresh, null, "0/2", It.IsAny<string>(), "Succeeded",
             It.IsAny<DateTimeOffset>(), It.IsAny<DateTimeOffset>(), null, null,
             It.IsAny<CancellationToken>()), Times.Once);
     }
@@ -178,13 +198,15 @@ public class BackgroundServiceCycleTests
     {
         private readonly IServiceScopeFactory scopeFactory;
 
-        public CycleHarness(int refreshed = 0, int raised = 0)
+        public CycleHarness(int refreshed = 0, int raised = 0, int completed = 0)
         {
             EtaServiceMock.Setup(s => s.RefreshEtasAsync(It.IsAny<CancellationToken>())).ReturnsAsync(refreshed);
             EtaServiceMock.Setup(s => s.RaiseStartRemindersAsync(It.IsAny<CancellationToken>())).ReturnsAsync(raised);
+            AutoCompletionMock.Setup(s => s.SweepAsync(It.IsAny<CancellationToken>())).ReturnsAsync(completed);
 
             var services = new ServiceCollection();
             services.AddScoped(_ => EtaServiceMock.Object);
+            services.AddScoped(_ => AutoCompletionMock.Object);
             services.AddScoped(_ =>
             {
                 RecorderResolutions++;
@@ -195,6 +217,8 @@ public class BackgroundServiceCycleTests
         }
 
         public Mock<ITripEtaService> EtaServiceMock { get; } = new();
+
+        public Mock<ITripAutoCompletionService> AutoCompletionMock { get; } = new();
 
         public Mock<IBackgroundJobRunRecorder> Recorder { get; } = new();
 

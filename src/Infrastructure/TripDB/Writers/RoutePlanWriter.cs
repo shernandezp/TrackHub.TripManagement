@@ -87,7 +87,6 @@ public sealed class RoutePlanWriter(IApplicationDbContext context) : IRoutePlanW
 
         await context.RoutePlans.AddAsync(plan, cancellationToken);
 
-        context.Trips.Attach(trip);
         trip.RoutePlanId = plan.RoutePlanId;
 
         await context.SaveChangesAsync(cancellationToken);
@@ -130,6 +129,6 @@ public sealed class RoutePlanWriter(IApplicationDbContext context) : IRoutePlanW
     }
 
     private async Task<Trip> FindTripAsync(Guid tripId, Guid accountId, CancellationToken cancellationToken)
-        => await context.Trips.FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken)
+        => await context.Trips.AsTracking().FirstOrDefaultAsync(t => t.TripId == tripId && t.AccountId == accountId, cancellationToken)
             ?? throw new NotFoundException($"{tripId}", nameof(Trip));
 }

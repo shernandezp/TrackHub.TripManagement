@@ -15,13 +15,14 @@
 
 using Common.Application.Interfaces;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using TrackHub.TripManagement.Infrastructure.TripDB.Writers;
 
 namespace Infrastructure.UnitTests;
 
 /// <summary>
-/// <c>TripWriter.UpdateTripProgressAsync</c> — the odometer, the last-seen point, and the
+/// <c>Trip.TryAdvanceProgress</c>, buffered by the detection unit of work — the odometer, the last-seen point, and the
 /// out-of-order guard.
 /// <para>
 /// This is the only writer detection calls for EVERY position of EVERY open trip, and it is the
@@ -66,8 +67,12 @@ public class TripProgressAccumulationTests
         // A trip must not inherit a distance from its very first sighting.
         using var context = await SeededAsync();
 
-        var accepted = await Writer(context).UpdateTripProgressAsync(
-            TripId, WriterTestData.AccountId, 4.65, -74.05, T0, 0d, CancellationToken.None);
+        var unit = await WriterTestData.LoadedUnitAsync(context);
+
+        var accepted = unit.TryAdvanceProgress(
+            TripId, 4.65, -74.05, T0, 0d);
+
+        await unit.FlushAsync(CancellationToken.None);
 
         var trip = await context.Trips.AsNoTracking().FirstAsync(t => t.TripId == TripId, CancellationToken.None);
         Assert.Multiple(() =>
@@ -87,11 +92,13 @@ public class TripProgressAccumulationTests
         // ActualDistanceMeters is a running total, not the last leg. Assigning instead of adding
         // leaves every completed trip reporting only the distance of its final hop.
         using var context = await SeededAsync();
-        var writer = Writer(context);
+        var unit = await WriterTestData.LoadedUnitAsync(context);
 
-        await writer.UpdateTripProgressAsync(TripId, WriterTestData.AccountId, 4.65, -74.05, T0, 0d, CancellationToken.None);
-        await writer.UpdateTripProgressAsync(TripId, WriterTestData.AccountId, 4.66, -74.06, T0.AddMinutes(1), 1500d, CancellationToken.None);
-        await writer.UpdateTripProgressAsync(TripId, WriterTestData.AccountId, 4.67, -74.07, T0.AddMinutes(2), 2500d, CancellationToken.None);
+        unit.TryAdvanceProgress(TripId, 4.65, -74.05, T0, 0d);
+        unit.TryAdvanceProgress(TripId, 4.66, -74.06, T0.AddMinutes(1), 1500d);
+        unit.TryAdvanceProgress(TripId, 4.67, -74.07, T0.AddMinutes(2), 2500d);
+
+        await unit.FlushAsync(CancellationToken.None);
 
         var trip = await context.Trips.AsNoTracking().FirstAsync(t => t.TripId == TripId, CancellationToken.None);
         Assert.Multiple(() =>
@@ -110,11 +117,12 @@ public class TripProgressAccumulationTests
         // Position feeds reorder. A late-arriving older fix must not rewind the trip's idea of
         // where the vehicle is, and must not add its leg to the odometer.
         using var context = await SeededAsync();
-        var writer = Writer(context);
+        var unit = await WriterTestData.LoadedUnitAsync(context);
 
-        await writer.UpdateTripProgressAsync(TripId, WriterTestData.AccountId, 4.65, -74.05, T0.AddMinutes(5), 0d, CancellationToken.None);
-        var accepted = await writer.UpdateTripProgressAsync(
-            TripId, WriterTestData.AccountId, 9.99, -70.0, T0, 999_999d, CancellationToken.None);
+        unit.TryAdvanceProgress(TripId, 4.65, -74.05, T0.AddMinutes(5), 0d);
+        var accepted = unit.TryAdvanceProgress(TripId, 9.99, -70.0, T0, 999_999d);
+
+        await unit.FlushAsync(CancellationToken.None);
 
         var trip = await context.Trips.AsNoTracking().FirstAsync(t => t.TripId == TripId, CancellationToken.None);
         Assert.Multiple(() =>
@@ -132,11 +140,12 @@ public class TripProgressAccumulationTests
         // "Not newer" is the rule, not "older". An exact replay — the common shape of a retried
         // batch — carries the same DeviceDateTime and would otherwise be counted twice.
         using var context = await SeededAsync();
-        var writer = Writer(context);
+        var unit = await WriterTestData.LoadedUnitAsync(context);
 
-        await writer.UpdateTripProgressAsync(TripId, WriterTestData.AccountId, 4.65, -74.05, T0, 0d, CancellationToken.None);
-        var replay = await writer.UpdateTripProgressAsync(
-            TripId, WriterTestData.AccountId, 4.65, -74.05, T0, 1500d, CancellationToken.None);
+        unit.TryAdvanceProgress(TripId, 4.65, -74.05, T0, 0d);
+        var replay = unit.TryAdvanceProgress(TripId, 4.65, -74.05, T0, 1500d);
+
+        await unit.FlushAsync(CancellationToken.None);
 
         var trip = await context.Trips.AsNoTracking().FirstAsync(t => t.TripId == TripId, CancellationToken.None);
         Assert.Multiple(() =>
@@ -152,28 +161,43 @@ public class TripProgressAccumulationTests
         // Defensive, and cheap: the odometer is monotonic by definition, and a negative leg from a
         // future caller bug would silently understate a completed trip.
         using var context = await SeededAsync();
-        var writer = Writer(context);
+        var unit = await WriterTestData.LoadedUnitAsync(context);
 
-        await writer.UpdateTripProgressAsync(TripId, WriterTestData.AccountId, 4.65, -74.05, T0, 5000d, CancellationToken.None);
-        await writer.UpdateTripProgressAsync(TripId, WriterTestData.AccountId, 4.66, -74.06, T0.AddMinutes(1), -3000d, CancellationToken.None);
+        unit.TryAdvanceProgress(TripId, 4.65, -74.05, T0, 5000d);
+        unit.TryAdvanceProgress(TripId, 4.66, -74.06, T0.AddMinutes(1), -3000d);
+
+        await unit.FlushAsync(CancellationToken.None);
 
         var trip = await context.Trips.AsNoTracking().FirstAsync(t => t.TripId == TripId, CancellationToken.None);
         Assert.That(trip.ActualDistanceMeters, Is.EqualTo(5000d).Within(1e-6));
     }
 
+    /// <summary>
+    /// Tenant scope on the write path, not only on the read path: the position feed is keyed by
+    /// transporter, and a mis-scoped batch must not write one account's movement onto another's trip.
+    /// <para>
+    /// The guarantee moved with the code and got stronger. It used to be a per-call account filter
+    /// on the update; now the working set itself is loaded per account, so a trip belonging to
+    /// somebody else is not merely un-writable — it is not in the unit at all, and every mutator is
+    /// a no-op against an id it never loaded.
+    /// </para>
+    /// </summary>
     [Test]
-    public async Task AFixForAnotherAccountsTrip_IsRejected()
+    public async Task AFixForAnotherAccountsTrip_IsNotEvenInTheWorkingSet()
     {
-        // Tenant scope on the write path, not only on the read path: the position feed is keyed by
-        // transporter and a mis-scoped call would write one account's movement onto another's trip.
         using var context = await SeededAsync();
 
-        var accepted = await Writer(context).UpdateTripProgressAsync(
-            TripId, Guid.NewGuid(), 4.65, -74.05, T0, 1000d, CancellationToken.None);
+        var foreignUnit = new TripDetectionUnitOfWork(context, NullLogger<TripDetectionUnitOfWork>.Instance);
+        var loaded = await foreignUnit.LoadAsync(
+            Guid.NewGuid(), [WriterTestData.TransporterId], null, CancellationToken.None);
+
+        var accepted = foreignUnit.TryAdvanceProgress(TripId, 4.65, -74.05, T0, 1000d);
+        await foreignUnit.FlushAsync(CancellationToken.None);
 
         var trip = await context.Trips.AsNoTracking().FirstAsync(t => t.TripId == TripId, CancellationToken.None);
         Assert.Multiple(() =>
         {
+            Assert.That(loaded, Is.Empty, "another account's trip was loaded into the working set");
             Assert.That(accepted, Is.False);
             Assert.That(trip.ActualDistanceMeters, Is.EqualTo(0d));
         });

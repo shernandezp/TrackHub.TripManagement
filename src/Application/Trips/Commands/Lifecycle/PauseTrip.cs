@@ -33,7 +33,6 @@ public readonly record struct PauseTripCommand(Guid TripId) : IRequest;
 public sealed class PauseTripCommandHandler(
     ITripWriter writer,
     ITripReader reader,
-    ITripEventWriter tripEventWriter,
     IAlertEmitter alertEmitter,
     IUserReader userReader,
     IUser user,
@@ -45,11 +44,13 @@ public sealed class PauseTripCommandHandler(
     {
         var caller = await userReader.GetUserAsync(UserId, cancellationToken);
         await TripLifecycleTransition.ExecuteAsync(
-            reader, writer, tripEventWriter, alertEmitter, logger,
+            reader, writer, alertEmitter, logger,
             request.TripId, caller.AccountId, TripVisibility.ResolveScopeUserId(user, UserId),
             TripStatuses.Paused, TripEventTypes.TripPaused, alertSeverity: null,
+            TripEventSources.Portal,
             reason: null, force: false,
             $"trip-pause:{request.TripId:N}:{DateTimeOffset.UtcNow.UtcTicks}",
+            measuredAt: null,
             cancellationToken);
     }
 }

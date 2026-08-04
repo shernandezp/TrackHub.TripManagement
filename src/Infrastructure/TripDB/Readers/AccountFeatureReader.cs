@@ -83,7 +83,12 @@ public sealed class AccountFeatureReader(IApplicationDbContext context) : IAccou
             return new TripAccountConfigVm(
                 ReadInt(root, "delayThresholdMinutes", TripAccountConfigVm.DefaultDelayThresholdMinutes),
                 ReadInt(root, "scheduleLeadMinutes", TripAccountConfigVm.DefaultScheduleLeadMinutes),
-                ReadDouble(root, "tollMatchToleranceMeters", TripAccountConfigVm.DefaultTollMatchToleranceMeters));
+                ReadDouble(root, "tollMatchToleranceMeters", TripAccountConfigVm.DefaultTollMatchToleranceMeters),
+                ReadInt(root, "activationLeadMinutes", TripAccountConfigVm.DefaultActivationLeadMinutes),
+                ReadInt(root, "backfillLookbackHours", TripAccountConfigVm.DefaultBackfillLookbackHours),
+                ReadInt(root, "finalStopCompletionMinutes", TripAccountConfigVm.DefaultFinalStopCompletionMinutes),
+                ReadInt(root, "overdueGraceMinutes", TripAccountConfigVm.DefaultOverdueGraceMinutes),
+                ReadBool(root, "autoLifecycle", TripAccountConfigVm.DefaultAutoLifecycle));
         }
         catch (JsonException)
         {
@@ -100,6 +105,18 @@ public sealed class AccountFeatureReader(IApplicationDbContext context) : IAccou
             && value.TryGetInt32(out var parsed)
             && parsed > 0
                 ? parsed
+                : fallback;
+
+    /// <summary>
+    /// Booleans get their own reader rather than riding the <c>&gt; 0</c> numeric guard: <c>false</c>
+    /// is a legitimate value an operator sets on purpose, so "absent" and "off" must stay
+    /// distinguishable. Anything that is not a JSON boolean falls back to the default.
+    /// </summary>
+    private static bool ReadBool(JsonElement root, string propertyName, bool fallback)
+        => root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty(propertyName, out var value)
+            && value.ValueKind is JsonValueKind.True or JsonValueKind.False
+                ? value.GetBoolean()
                 : fallback;
 
     private static double ReadDouble(JsonElement root, string propertyName, double fallback)

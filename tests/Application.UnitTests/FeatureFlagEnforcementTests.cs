@@ -164,6 +164,7 @@ public class FeatureFlagEnforcementTests
     private static ApplicationDbContext InMemoryContext()
         => new(new DbContextOptionsBuilder<ApplicationDbContext>()
             .UseInMemoryDatabase($"trip-feature-flags-{Guid.NewGuid()}")
+            .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking)
             .Options);
 
     private static IConfiguration Configuration()

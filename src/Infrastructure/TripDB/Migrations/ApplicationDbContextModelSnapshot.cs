@@ -284,14 +284,94 @@ namespace TrackHub.TripManagement.Infrastructure.Migrations
                         .HasColumnType("boolean")
                         .HasColumnName("active");
 
+                    b.Property<Point>("CircleCenter")
+                        .HasColumnType("geometry (Point, 4326)")
+                        .HasColumnName("circlecenter");
+
                     b.Property<Polygon>("Geom")
                         .IsRequired()
                         .HasColumnType("geometry (Polygon, 4326)")
                         .HasColumnName("geom");
 
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("name");
+
                     b.HasKey("GeofenceId");
 
                     b.ToTable("geofences", "geofencing", t =>
+                        {
+                            t.ExcludeFromMigrations();
+                        });
+                });
+
+            modelBuilder.Entity("TrackHub.TripManagement.Infrastructure.TripDB.Entities.GeofenceVisit", b =>
+                {
+                    b.Property<Guid>("GeofenceVisitId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<Guid>("AccountId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("accountid");
+
+                    b.Property<DateTimeOffset?>("DepartedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("departuretimestamp");
+
+                    b.Property<DateTimeOffset>("EnteredAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("datetime");
+
+                    b.Property<Guid>("GeofenceId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("geofenceid");
+
+                    b.Property<Guid>("TransporterId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("transporterid");
+
+                    b.HasKey("GeofenceVisitId");
+
+                    b.ToTable("geofenceevents", "geofencing", t =>
+                        {
+                            t.ExcludeFromMigrations();
+                        });
+                });
+
+            modelBuilder.Entity("TrackHub.TripManagement.Infrastructure.TripDB.Entities.PointOfInterest", b =>
+                {
+                    b.Property<Guid>("PointOfInterestId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<Guid>("AccountId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("accountid");
+
+                    b.Property<bool>("Active")
+                        .HasColumnType("boolean")
+                        .HasColumnName("active");
+
+                    b.Property<double>("Latitude")
+                        .HasColumnType("double precision")
+                        .HasColumnName("latitude");
+
+                    b.Property<double>("Longitude")
+                        .HasColumnType("double precision")
+                        .HasColumnName("longitude");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("name");
+
+                    b.HasKey("PointOfInterestId");
+
+                    b.ToTable("points_of_interest", "map", t =>
                         {
                             t.ExcludeFromMigrations();
                         });
@@ -817,6 +897,10 @@ namespace TrackHub.TripManagement.Infrastructure.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("actualstartat");
 
+                    b.Property<DateTimeOffset?>("ArmedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("armedat");
+
                     b.Property<string>("CancellationReason")
                         .HasMaxLength(500)
                         .HasColumnType("character varying(500)")
@@ -877,16 +961,42 @@ namespace TrackHub.TripManagement.Infrastructure.Migrations
                         .HasColumnType("character varying(2000)")
                         .HasColumnName("notes");
 
+                    b.Property<DateTimeOffset?>("OriginArrivedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("originarrivedat");
+
+                    b.Property<DateTimeOffset?>("OriginDepartedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("origindepartedat");
+
+                    b.Property<Guid?>("OriginGeofenceId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("origingeofenceid");
+
+                    b.Property<Polygon>("OriginGeom")
+                        .HasColumnType("geometry (Polygon, 4326)")
+                        .HasColumnName("origingeom");
+
                     b.Property<string>("OriginName")
                         .IsRequired()
                         .HasMaxLength(200)
                         .HasColumnType("character varying(200)")
                         .HasColumnName("originname");
 
+                    b.Property<DateTimeOffset?>("OriginOutsideSinceAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("originoutsidesinceat");
+
                     b.Property<Point>("OriginPoint")
                         .IsRequired()
                         .HasColumnType("geometry (Point, 4326)")
                         .HasColumnName("originpoint");
+
+                    b.Property<int>("OriginRadiusMeters")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(150)
+                        .HasColumnName("originradiusmeters");
 
                     b.Property<DateTimeOffset?>("PlannedEndAt")
                         .HasColumnType("timestamp with time zone")
@@ -919,7 +1029,23 @@ namespace TrackHub.TripManagement.Infrastructure.Migrations
                         .HasColumnType("uuid")
                         .HasColumnName("transporterid");
 
+                    b.Property<uint>("xmin")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAddOrUpdate()
+                        .HasColumnType("xid")
+                        .HasColumnName("xmin");
+
                     b.HasKey("TripId");
+
+                    b.HasIndex("OriginGeom")
+                        .HasDatabaseName("ix_trips_origingeom_gist");
+
+                    NpgsqlIndexBuilderExtensions.HasMethod(b.HasIndex("OriginGeom"), "gist");
+
+                    b.HasIndex("TransporterId")
+                        .IsUnique()
+                        .HasDatabaseName("ux_trips_transporterid_inprogress")
+                        .HasFilter("status IN ('InProgress', 'Paused')");
 
                     b.HasIndex("AccountId", "Code")
                         .IsUnique()
@@ -1214,6 +1340,14 @@ namespace TrackHub.TripManagement.Infrastructure.Migrations
                     b.Property<Guid>("AccountId")
                         .HasColumnType("uuid")
                         .HasColumnName("accountid");
+
+                    b.Property<string>("Activity")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)")
+                        .HasDefaultValue("Unload")
+                        .HasColumnName("activity");
 
                     b.Property<DateTimeOffset?>("ActualArrivalAt")
                         .HasColumnType("timestamp with time zone")

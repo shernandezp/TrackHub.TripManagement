@@ -27,7 +27,16 @@ public sealed class TripStopDtoValidator : AbstractValidator<TripStopDto>
         RuleFor(v => v.City).MaximumLength(200);
         RuleFor(v => v.Latitude).InclusiveBetween(-90d, 90d);
         RuleFor(v => v.Longitude).InclusiveBetween(-180d, 180d);
-        RuleFor(v => v.ArrivalRadiusMeters).InclusiveBetween(50, 5000);
+        RuleFor(v => v.ArrivalRadiusMeters)
+            .InclusiveBetween(TripGeometry.MinRadiusMeters, TripGeometry.MaxRadiusMeters);
+
+        // Deliberately not NotEmpty: an omitted activity is normalized to Unload by the writer, so
+        // a client that predates the field keeps working. Only a value that is present AND wrong is
+        // a validation failure.
+        RuleFor(v => v.Activity)
+            .Must(TripStopActivities.IsValid)
+            .When(v => !string.IsNullOrWhiteSpace(v.Activity))
+            .WithMessage("Unknown stop activity.");
         RuleFor(v => v.Observations).MaximumLength(1000);
         RuleFor(v => v.PlannedArrivalTo)
             .GreaterThanOrEqualTo(v => v.PlannedArrivalFrom!.Value)

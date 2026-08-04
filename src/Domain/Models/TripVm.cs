@@ -15,7 +15,15 @@
 
 namespace TrackHub.TripManagement.Domain.Models;
 
-/// <summary>Dispatch-board projection of a trip. Carries no stop or route detail.</summary>
+/// <summary>
+/// Dispatch-board projection of a trip. Carries no stop or route detail — except the derived
+/// <see cref="Phase"/>, which is the one thing the board leads with (spec 11a §10).
+/// <para>
+/// <see cref="ActualStartAt"/> and <see cref="ActualEndAt"/> are MEASURED by default: the instant
+/// the vehicle reached its origin zone and the instant its route closed. A manual override still
+/// writes them, and the timeline's <c>Source</c> is the permanent record of which happened (§5.3).
+/// </para>
+/// </summary>
 public readonly record struct TripVm(
     Guid TripId,
     Guid AccountId,
@@ -30,10 +38,23 @@ public readonly record struct TripVm(
     string OriginName,
     double OriginLatitude,
     double OriginLongitude,
+    Guid? OriginGeofenceId,
+    int OriginRadiusMeters,
     DateTimeOffset PlannedStartAt,
     DateTimeOffset? PlannedEndAt,
     DateTimeOffset? ActualStartAt,
     DateTimeOffset? ActualEndAt,
+    DateTimeOffset? ArmedAt,
+    DateTimeOffset? OriginArrivedAt,
+    DateTimeOffset? OriginDepartedAt,
+    string Phase,
+    string? PhaseStopName,
+    string? PhaseStopActivity,
+    DateTimeOffset? PhaseEtaAt,
+
+    // True when the stop the phase names has already raised TripDelayed. One definition of
+    // "delayed" for the alert, the board badge and the exception filter alike.
+    bool PhaseDelayed,
     string? Notes,
     DateTimeOffset? LastPositionAt,
     double? LastLatitude,
@@ -43,6 +64,11 @@ public readonly record struct TripVm(
     DateTimeOffset? DeviationOpenedAt,
     string? CancellationReason,
     int StopCount,
+
+    // How much of the route is still ahead. The board's "stalled at final stop" filter needs to tell
+    // a truck unloading at stop 2 of 5 from one parked at the last stop with nowhere left to go, and
+    // the phase alone cannot: both read AtStop. Zero here plus AtStop IS the stalled condition.
+    int PendingStopCount,
     DateTimeOffset LastModified);
 
 public readonly record struct TripsPageVm(IReadOnlyCollection<TripVm> Items, int TotalCount);
@@ -75,6 +101,7 @@ public readonly record struct TripStopVm(
     double Longitude,
     Guid? GeofenceId,
     int ArrivalRadiusMeters,
+    string Activity,
     DateTimeOffset? PlannedArrivalFrom,
     DateTimeOffset? PlannedArrivalTo,
     string Status,
@@ -197,3 +224,17 @@ public readonly record struct TripProcessingResultVm(
     int DeviationsRaised);
 
 public readonly record struct UserVm(Guid UserId, Guid AccountId, string Username);
+
+/// <summary>An id and the name a human would type for it — what bulk planning resolves against.</summary>
+public readonly record struct NamedEntityVm(Guid Id, string Name);
+
+/// <summary>
+/// Outcome of a bulk trip upload. Rows that failed are reported individually and the rest still
+/// landed, so the operator fixes those lines and re-imports rather than guessing (spec 11a §9.1).
+/// </summary>
+public readonly record struct TripCsvImportResultVm(
+    int RowsRead,
+    int TripsCreated,
+    IReadOnlyCollection<TripCsvImportErrorVm> Errors);
+
+public readonly record struct TripCsvImportErrorVm(int RowNumber, string ErrorCode, string Message);

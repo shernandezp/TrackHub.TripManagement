@@ -69,6 +69,7 @@ public sealed class TransporterTollClassStore(IApplicationDbContext context) : I
         CancellationToken cancellationToken)
     {
         var existing = await context.TransporterTollClasses
+            .AsTracking()
             .FirstOrDefaultAsync(
                 m => m.AccountId == accountId
                     && m.TransporterTypeId == transporterTypeId
@@ -77,7 +78,6 @@ public sealed class TransporterTollClassStore(IApplicationDbContext context) : I
 
         if (existing is not null)
         {
-            context.TransporterTollClasses.Attach(existing);
             existing.TollVehicleClassCode = vehicleClassCode;
             await context.SaveChangesAsync(cancellationToken);
             return TripMapper.ToVm(existing);

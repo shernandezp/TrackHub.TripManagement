@@ -33,6 +33,8 @@ public interface IApplicationDbContext
 
     // Read-only, cross-service.
     DbSet<Geofence> Geofences { get; set; }
+    DbSet<GeofenceVisit> GeofenceVisits { get; set; }
+    DbSet<PointOfInterest> PointsOfInterest { get; set; }
     DbSet<Transporter> Transporters { get; set; }
     DbSet<Driver> Drivers { get; set; }
     DbSet<VwVisibleTransporter> VisibleTransporters { get; set; }

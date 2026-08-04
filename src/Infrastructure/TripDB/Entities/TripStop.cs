@@ -53,6 +53,13 @@ public sealed class TripStop : BaseAuditableEntity
     public int ArrivalRadiusMeters { get; set; } = TripGeometryDefaults.ArrivalRadiusMeters;
     public DateTimeOffset? PlannedArrivalFrom { get; set; }
     public DateTimeOffset? PlannedArrivalTo { get; set; }
+    /// <summary>
+    /// What the vehicle does here — <c>Load</c>, <c>Unload</c> or <c>Other</c>. This is what gives
+    /// dwell a meaning: the dwell of a <c>Load</c> stop IS loading time, of an <c>Unload</c> stop
+    /// unloading time. A round trip's return-to-depot stop defaults to <c>Other</c>, because parking
+    /// at home is neither.
+    /// </summary>
+    public string Activity { get; set; } = TripStopActivities.Unload;
     public string Status { get; set; } = TripStopStatuses.Pending;
     public DateTimeOffset? ActualArrivalAt { get; set; }
     public DateTimeOffset? ActualDepartureAt { get; set; }
@@ -73,4 +80,81 @@ public sealed class TripStop : BaseAuditableEntity
     public string? Observations { get; set; }
 
     public Trip? Trip { get; set; }
+
+    // ---------------------------------------------------------------- behaviour
+
+    /// <summary>The persisted exit-debounce clock; null restarts it from zero.</summary>
+    public bool SetOutsideSince(DateTimeOffset? outsideSinceAt)
+    {
+        if (OutsideSinceAt == outsideSinceAt)
+        {
+            return false;
+        }
+
+        OutsideSinceAt = outsideSinceAt;
+        return true;
+    }
+
+    /// <summary>
+    /// Applies a stop progression and hands back everything needed to undo it.
+    /// <para>
+    /// <b>Timestamps once written are never overwritten</b> by a later detection or manual override
+    /// (acceptance 12) — the status still advances, but only the first recorded instant survives.
+    /// </para>
+    /// <para>
+    /// The revert token is the same reason the trip has one: the row may be carrying a pending
+    /// arrival-geometry snapshot from arming in this very batch, and detaching it to undo a
+    /// duplicate progress event — which the writer used to do — discarded that silently.
+    /// </para>
+    /// </summary>
+    public TripStopProgressRevert ApplyProgress(string toStatus, DateTimeOffset occurredAt, string? reason)
+    {
+        var revert = new TripStopProgressRevert(Status, ActualArrivalAt, ActualDepartureAt, OutsideSinceAt, Observations);
+
+        switch (toStatus)
+        {
+            case TripStopStatuses.Arrived:
+                ActualArrivalAt ??= occurredAt;
+
+                // Arriving restarts the departure debounce from scratch: a clock left over from an
+                // earlier excursion would otherwise already be 30 s "old" when the vehicle rolls out.
+                OutsideSinceAt = null;
+                break;
+            case TripStopStatuses.Departed:
+                ActualDepartureAt ??= occurredAt;
+                OutsideSinceAt = null;
+                break;
+            case TripStopStatuses.Skipped:
+                Observations = reason ?? Observations;
+                OutsideSinceAt = null;
+                break;
+            default:
+                return revert;
+        }
+
+        if (!TripStopStatuses.IsClosed(Status))
+        {
+            Status = toStatus;
+        }
+
+        return revert;
+    }
+
+    /// <summary>Undoes exactly the fields <see cref="ApplyProgress"/> moved.</summary>
+    public void RevertProgress(TripStopProgressRevert revert)
+    {
+        Status = revert.Status;
+        ActualArrivalAt = revert.ActualArrivalAt;
+        ActualDepartureAt = revert.ActualDepartureAt;
+        OutsideSinceAt = revert.OutsideSinceAt;
+        Observations = revert.Observations;
+    }
 }
+
+/// <summary>The stop fields a progression moves, captured so it can be undone in place.</summary>
+public readonly record struct TripStopProgressRevert(
+    string Status,
+    DateTimeOffset? ActualArrivalAt,
+    DateTimeOffset? ActualDepartureAt,
+    DateTimeOffset? OutsideSinceAt,
+    string? Observations);

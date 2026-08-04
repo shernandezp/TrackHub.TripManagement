@@ -33,7 +33,6 @@ public readonly record struct AbortTripCommand(Guid TripId, string Reason) : IRe
 public sealed class AbortTripCommandHandler(
     ITripWriter writer,
     ITripReader reader,
-    ITripEventWriter tripEventWriter,
     IAlertEmitter alertEmitter,
     IUserReader userReader,
     IUser user,
@@ -45,11 +44,13 @@ public sealed class AbortTripCommandHandler(
     {
         var caller = await userReader.GetUserAsync(UserId, cancellationToken);
         await TripLifecycleTransition.ExecuteAsync(
-            reader, writer, tripEventWriter, alertEmitter, logger,
+            reader, writer, alertEmitter, logger,
             request.TripId, caller.AccountId, TripVisibility.ResolveScopeUserId(user, UserId),
             TripStatuses.Aborted, TripEventTypes.TripAborted, alertSeverity: null,
+            TripEventSources.Portal,
             reason: request.Reason, force: false,
             $"trip-abort:{request.TripId:N}",
+            measuredAt: null,
             cancellationToken);
     }
 }

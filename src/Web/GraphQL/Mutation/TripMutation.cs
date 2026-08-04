@@ -16,9 +16,11 @@
 using TrackHub.TripManagement.Application.Trips.Commands.Assign;
 using TrackHub.TripManagement.Application.Trips.Commands.Create;
 using TrackHub.TripManagement.Application.Trips.Commands.Delete;
+using TrackHub.TripManagement.Application.Trips.Commands.ImportCsv;
 using TrackHub.TripManagement.Application.Trips.Commands.Lifecycle;
 using TrackHub.TripManagement.Application.Trips.Commands.PlanRoute;
 using TrackHub.TripManagement.Application.Trips.Commands.Update;
+using TrackHub.TripManagement.Application.Trips.Services.Interfaces;
 
 namespace TrackHub.TripManagement.Web.GraphQL.Mutation;
 
@@ -44,6 +46,13 @@ public partial class Mutation
     public async Task<TripAssignmentVm> AssignTrip([Service] ISender sender, AssignTripCommand command, CancellationToken cancellationToken)
         => await sender.Send(command, cancellationToken);
 
+    /// <summary>
+    /// Bulk trip planning from a spreadsheet (spec 11a §9.1). Per-row results; one bad row never
+    /// fails the batch.
+    /// </summary>
+    public async Task<TripCsvImportResultVm> ImportTripsCsv([Service] ISender sender, ImportTripsCsvCommand command, CancellationToken cancellationToken)
+        => await sender.Send(command, cancellationToken);
+
     public async Task<RoutePlanVm> PlanTripRoute([Service] ISender sender, PlanTripRouteCommand command, CancellationToken cancellationToken)
         => await sender.Send(command, cancellationToken);
 
@@ -52,6 +61,15 @@ public partial class Mutation
         await sender.Send(new StartTripCommand(id), cancellationToken);
         return true;
     }
+
+    /// <summary>
+    /// Records that a freshly planned trip is already under way, backfilling what Geofencing
+    /// measured (spec 11a §5.4). Returns whether the start came from evidence or from the caller's
+    /// declaration, so the dispatcher can see which.
+    /// </summary>
+    public async Task<TripStartBackfillResultVm> DeclareTripInTransit(
+        [Service] ISender sender, DeclareTripInTransitCommand command, CancellationToken cancellationToken)
+        => await sender.Send(command, cancellationToken);
 
     public async Task<bool> PauseTrip([Service] ISender sender, Guid id, CancellationToken cancellationToken)
     {

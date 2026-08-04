@@ -27,14 +27,19 @@ namespace TrackHub.TripManagement.Application.Trips.Commands.Lifecycle;
 public static class TripLifecycleTransition
 {
     /// <summary>
-    /// Validates the transition, applies it, appends the timeline event, then emits the alert.
-    /// Alert emission is best-effort and isolated — a Manager outage must never roll back a
-    /// transition the operator already saw succeed.
+    /// Validates the transition, applies it — status, timestamps and timeline event in one save —
+    /// then emits the alert. Alert emission is best-effort and isolated: a Manager outage must never
+    /// roll back a transition the operator already saw succeed.
+    /// <para>
+    /// The <paramref name="source"/> is a PARAMETER, not the hardcoded <c>Portal</c> it used to be.
+    /// Detection transitions trips now, and the timeline's source is the permanent record of whether
+    /// a start was measured or declared — a hardcoded value made every automatic transition claim to
+    /// be a dispatcher's click (spec 11a §5.3, §12.1).
+    /// </para>
     /// </summary>
     public static async Task<TripVm> ExecuteAsync(
         ITripReader reader,
         ITripWriter writer,
-        ITripEventWriter tripEventWriter,
         IAlertEmitter alertEmitter,
         ILogger logger,
         Guid tripId,
@@ -43,9 +48,11 @@ public static class TripLifecycleTransition
         string toStatus,
         string eventType,
         string? alertSeverity,
+        string source,
         string? reason,
         bool force,
-        string idempotencySuffix,
+        string idempotencyKey,
+        DateTimeOffset? measuredAt,
         CancellationToken cancellationToken)
     {
         // The scope travels with the id: all six lifecycle verbs run through here, so a
@@ -60,19 +67,27 @@ public static class TripLifecycleTransition
                 TripStatuses.IsTerminal(trip.Status) ? TripErrorCodes.TripAlreadyTerminal : TripErrorCodes.InvalidTransition);
         }
 
-        await writer.TransitionTripAsync(tripId, accountId, toStatus, reason, force, cancellationToken);
-
-        var occurredAt = DateTimeOffset.UtcNow;
-        await tripEventWriter.AppendAsync(
-            accountId,
+        var occurredAt = measuredAt ?? DateTimeOffset.UtcNow;
+        var applied = await writer.TransitionTripAsync(
             tripId,
-            null,
+            accountId,
+            toStatus,
             eventType,
-            occurredAt,
-            TripEventSources.Portal,
+            source,
+            idempotencyKey,
             reason is null ? null : $$"""{"reason":"{{reason}}","forced":{{(force ? "true" : "false")}}}""",
-            idempotencySuffix,
+            reason,
+            force,
+            measuredAt,
             cancellationToken);
+
+        // A duplicate or a lost race wrote NOTHING, so it must emit nothing either. The writer's
+        // result is discarded no longer: swallowing it is what let a racing start emit two alerts
+        // for one trip (spec 11a §12.1).
+        if (!applied)
+        {
+            return trip;
+        }
 
         if (alertSeverity is not null)
         {

@@ -28,7 +28,9 @@ public sealed class GeofenceConfiguration : IEntityTypeConfiguration<Geofence>
         builder.HasKey(x => x.GeofenceId);
         builder.Property(x => x.GeofenceId).HasColumnName("id");
         builder.Property(x => x.AccountId).HasColumnName("accountid");
+        builder.Property(x => x.Name).HasColumnName("name");
         builder.Property(x => x.Geom).HasColumnName("geom").HasColumnType("geometry (Polygon, 4326)");
+        builder.Property(x => x.CircleCenter).HasColumnName("circlecenter").HasColumnType("geometry (Point, 4326)");
         builder.Property(x => x.Active).HasColumnName("active");
     }
 }

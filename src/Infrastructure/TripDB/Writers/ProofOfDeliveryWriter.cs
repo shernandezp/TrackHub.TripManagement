@@ -106,6 +106,11 @@ public sealed class ProofOfDeliveryWriter(IApplicationDbContext context) : IProo
         return (TripMapper.ToVm(entity, [.. documents.Select(TripMapper.ToVm)]), true);
     }
 
+    public async Task<bool> HasAsync(Guid accountId, Guid tripStopId, Guid clientEventId, CancellationToken cancellationToken)
+        => await context.ProofsOfDelivery
+            .AnyAsync(p => p.TripStopId == tripStopId && p.ClientEventId == clientEventId && p.AccountId == accountId,
+                cancellationToken);
+
     private async Task<ProofOfDeliveryVm?> ExistingAsync(
         Guid accountId,
         ProofOfDeliveryDto proofOfDelivery,

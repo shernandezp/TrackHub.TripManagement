@@ -18,10 +18,18 @@ using NetTopologySuite.Geometries;
 namespace TrackHub.TripManagement.Infrastructure.TripDB.Readers;
 
 /// <summary>
-/// The detection working set. Unlike Geofencing - which must consider an account's whole zone
-/// catalog - trip detection only ever looks at <c>InProgress</c> trips (spec 11 section 18.4).
-/// Every containment test is evaluated in PostGIS against the snapshotted geometry, never in
-/// application code.
+/// Read-only queries for the detection pipeline: completion candidates, ETA candidates, schedule
+/// reminders, and the one containment test that genuinely belongs in the database.
+/// <para>
+/// The working SET is not here — <see cref="ITripDetectionUnitOfWork"/> owns it, because selecting
+/// those trips and holding them tracked for the batch is one decision, not two.
+/// </para>
+/// <para>
+/// Neither is origin or stop containment, and the dividing line is worth stating: those geometries
+/// are already materialized with the working set, so testing them in PostGIS was a round trip per
+/// fix that no index was helping (both queries filter to one row by key). A CORRIDOR is different —
+/// it buffers an entire route, is far too large to load per batch, and so is tested where it lives.
+/// </para>
 /// </summary>
 public sealed class TripDetectionReader(IApplicationDbContext context) : ITripDetectionReader
 {
@@ -31,93 +39,44 @@ public sealed class TripDetectionReader(IApplicationDbContext context) : ITripDe
     /// </summary>
     private const int MaxTripsPerCycle = 1000;
 
-    public async Task<IReadOnlyCollection<OpenTripVm>> GetOpenTripsAsync(
-        Guid accountId,
-        IReadOnlyCollection<Guid> transporterIds,
-        CancellationToken cancellationToken)
-    {
-        if (transporterIds.Count == 0)
-        {
-            return [];
-        }
-
-        var ids = transporterIds.ToList();
-
-        var trips = await context.Trips
+    public async Task<IReadOnlyCollection<Guid>> GetCompletionCandidatesAsync(Guid accountId, CancellationToken cancellationToken)
+        => await context.Trips
             .Where(t => t.AccountId == accountId
                 && t.Status == TripStatuses.InProgress
-                && ids.Contains(t.TransporterId))
+                && context.TripStops.Any(s => s.TripId == t.TripId)
+                && !context.TripStops.Any(s => s.TripId == t.TripId && s.Status == TripStopStatuses.Pending))
             .OrderBy(t => t.PlannedStartAt)
             .Take(MaxTripsPerCycle)
+            .Select(t => t.TripId)
             .ToListAsync(cancellationToken);
 
-        if (trips.Count == 0)
+    public async Task<TripCompletionCandidateVm?> GetCompletionStateAsync(Guid accountId, Guid tripId, CancellationToken cancellationToken)
+    {
+        var trip = await context.Trips
+            .Where(t => t.TripId == tripId && t.AccountId == accountId)
+            .Select(t => new { t.TripId, t.Code, t.Status, t.TransporterId, t.DriverId })
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (trip is null)
         {
-            return [];
+            return null;
         }
 
-        var tripIds = trips.ConvertAll(t => t.TripId);
-
-        // Only stops detection may still act on: Departed and Skipped are closed.
+        // Ordering on the entity column, before the projection - see TripMapper for why.
         var stops = await context.TripStops
-            .Where(s => tripIds.Contains(s.TripId)
-                && (s.Status == TripStopStatuses.Pending || s.Status == TripStopStatuses.Arrived))
-            .OrderBy(s => s.TripId)
-            .ThenBy(s => s.Sequence)
-            .ToListAsync(cancellationToken);
-
-        var readyPlanTripIds = await context.RoutePlans
-            .Where(p => tripIds.Contains(p.TripId) && p.Status == RoutePlanStatuses.Ready)
-            .Select(p => p.TripId)
-            .Distinct()
-            .ToListAsync(cancellationToken);
-
-        return [.. trips.Select(t => new OpenTripVm(
-            t.TripId,
-            t.AccountId,
-            t.Code,
-            t.TransporterId,
-            t.DriverId,
-            t.RoutePlanId,
-            readyPlanTripIds.Contains(t.TripId),
-            t.DeviationOpenedAt,
-            t.ConsecutiveOutsideFixes,
-            t.ActualDistanceMeters,
-            t.LastPoint?.Y,
-            t.LastPoint?.X,
-            t.LastPositionAt,
-            [.. stops.Where(s => s.TripId == t.TripId).Select(s => new OpenTripStopVm(
-                s.TripStopId,
-                s.Sequence,
-                s.Name,
-                s.Status,
-                s.ActualArrivalAt,
-                s.PlannedArrivalTo,
-                s.DelayAlertedAt,
-                s.OutsideSinceAt,
-                s.Point.Y,
-                s.Point.X))]))];
-    }
-
-    public async Task<IReadOnlyCollection<Guid>> GetStopsContainingPointAsync(
-        Guid accountId,
-        Guid tripId,
-        double latitude,
-        double longitude,
-        CancellationToken cancellationToken)
-    {
-        var point = NewPoint(latitude, longitude);
-
-        // ST_Contains against the SNAPSHOT taken at trip start, so a geofence edited mid-trip
-        // cannot move a running trip's arrival geometry (spec 11 section 18.4).
-        return await context.TripStops
-            .Where(s => s.AccountId == accountId
-                && s.TripId == tripId
-                && s.ArrivalGeom != null
-                && s.ArrivalGeom.Contains(point))
+            .Where(s => s.TripId == tripId && s.AccountId == accountId)
             .OrderBy(s => s.Sequence)
-            .Select(s => s.TripStopId)
+            .Select(s => new { s.TripStopId, s.Sequence, s.Status, s.ActualArrivalAt, s.ActualDepartureAt, s.OutsideSinceAt })
             .ToListAsync(cancellationToken);
+
+        return new TripCompletionCandidateVm(
+            trip.TripId,
+            trip.Code,
+            trip.Status,
+            trip.TransporterId,
+            trip.DriverId,
+            [.. stops.Select(s => new CompletionStopVm(
+                s.TripStopId, s.Sequence, s.Status, s.ActualArrivalAt, s.ActualDepartureAt, s.OutsideSinceAt))]);
     }
 
     public async Task<bool?> IsInsideCorridorAsync(Guid accountId, Guid routePlanId, double latitude, double longitude, CancellationToken cancellationToken)

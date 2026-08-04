@@ -25,8 +25,44 @@ namespace TrackHub.TripManagement.Infrastructure.TripDB.Readers;
 /// no reader here joins the group graph by hand.
 /// </para>
 /// </summary>
-public sealed class TripReader(IApplicationDbContext context) : ITripReader
+public sealed class TripReader(IApplicationDbContext context, IAccountFeatureReader accountFeatureReader) : ITripReader
 {
+    /// <summary>
+    /// The phase every list and detail read is computed against. It needs one number from the
+    /// account's configuration (how long past a planned start counts as overdue) and the stops'
+    /// current state — both fetched once per read, alongside the stop counts the page already
+    /// gathered (spec 11a §10).
+    /// </summary>
+    private async Task<(int OverdueGraceMinutes, Dictionary<Guid, List<PhaseStopVm>> StopsByTrip)> PhaseContextAsync(
+        Guid accountId, IReadOnlyCollection<Guid> tripIds, CancellationToken cancellationToken)
+    {
+        var config = await accountFeatureReader.GetAccountConfigAsync(accountId, cancellationToken);
+
+        if (tripIds.Count == 0)
+        {
+            return (config.OverdueGraceMinutes, []);
+        }
+
+        var ids = tripIds.ToList();
+
+        // One grouped query for the whole page, not one per row. Ordering on the entity column
+        // inside the query and before the projection - see TripMapper for why.
+        var stops = await context.TripStops
+            .Where(s => ids.Contains(s.TripId) && s.AccountId == accountId)
+            .OrderBy(s => s.TripId)
+            .ThenBy(s => s.Sequence)
+            .Select(s => new { s.TripId, s.Sequence, s.Name, s.Activity, s.Status, s.EtaAt, s.DelayAlertedAt })
+            .ToListAsync(cancellationToken);
+
+        var byTrip = stops
+            .GroupBy(s => s.TripId)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(s => new PhaseStopVm(s.Sequence, s.Name, s.Activity, s.Status, s.EtaAt, s.DelayAlertedAt)).ToList());
+
+        return (config.OverdueGraceMinutes, byTrip);
+    }
+
     public async Task<TripsPageVm> GetTripsPageAsync(
         Guid accountId,
         Guid? userId,
@@ -123,10 +159,11 @@ public sealed class TripReader(IApplicationDbContext context) : ITripReader
             .OrderByDescending(s => s.Created)
             .ToListAsync(cancellationToken);
 
-        var stopCount = stops.Count;
+        var config = await accountFeatureReader.GetAccountConfigAsync(accountId, cancellationToken);
+        var phaseStops = stops.ConvertAll(s => new PhaseStopVm(s.Sequence, s.Name, s.Activity, s.Status, s.EtaAt, s.DelayAlertedAt));
 
         return new TripDetailVm(
-            TripMapper.ToVm(trip, stopCount),
+            TripMapper.ToVm(trip, stops.Count, phaseStops, config.OverdueGraceMinutes),
             [.. stops.Select(s => TripMapper.ToVm(
                 s,
                 [.. deliveries.Where(d => d.TripStopId == s.TripStopId).Select(TripMapper.ToVm)]))],
@@ -180,8 +217,10 @@ public sealed class TripReader(IApplicationDbContext context) : ITripReader
             .FirstOrDefaultAsync(t => t.TripId == tripId, cancellationToken)
             ?? throw new NotFoundException($"{tripId}", nameof(Trip));
 
-        var stopCount = await context.TripStops.CountAsync(s => s.TripId == tripId, cancellationToken);
-        return TripMapper.ToVm(trip, stopCount);
+        var (overdueGraceMinutes, stopsByTrip) = await PhaseContextAsync(accountId, [tripId], cancellationToken);
+        var stops = stopsByTrip.TryGetValue(tripId, out var found) ? found : [];
+
+        return TripMapper.ToVm(trip, stops.Count, stops, overdueGraceMinutes);
     }
 
     public async Task<Guid?> FindVisibleTripIdByStopAsync(Guid tripStopId, Guid accountId, Guid? userId, CancellationToken cancellationToken)
@@ -216,6 +255,39 @@ public sealed class TripReader(IApplicationDbContext context) : ITripReader
         => await context.Geofences.AnyAsync(
             g => g.GeofenceId == geofenceId && g.AccountId == accountId,
             cancellationToken);
+
+    public async Task<IReadOnlyCollection<NamedEntityVm>> GetTransporterNamesAsync(Guid accountId, Guid? userId, CancellationToken cancellationToken)
+    {
+        var query = context.Transporters.Where(t => t.AccountId == accountId);
+
+        // The same EXISTS predicate the trip queries use, against the same view: bulk planning is
+        // subject to group visibility exactly as the create dialog is (acceptance 4).
+        if (userId is { } actingUserId)
+        {
+            query = query.Where(t => context.VisibleTransporters.Any(v =>
+                v.AccountId == accountId
+                && v.UserId == actingUserId
+                && v.TransporterId == t.TransporterId));
+        }
+
+        var rows = await query
+            .OrderBy(t => t.Name)
+            .Select(t => new { t.TransporterId, t.Name })
+            .ToListAsync(cancellationToken);
+
+        return [.. rows.Select(r => new NamedEntityVm(r.TransporterId, r.Name))];
+    }
+
+    public async Task<IReadOnlyCollection<NamedEntityVm>> GetDriverNamesAsync(Guid accountId, CancellationToken cancellationToken)
+    {
+        var rows = await context.Drivers
+            .Where(d => d.AccountId == accountId)
+            .OrderBy(d => d.Name)
+            .Select(d => new { d.DriverId, d.Name })
+            .ToListAsync(cancellationToken);
+
+        return [.. rows.Select(r => new NamedEntityVm(r.DriverId, r.Name))];
+    }
 
     public async Task<TripsPageVm> GetReportDataAsync(
         Guid accountId,
@@ -287,6 +359,9 @@ public sealed class TripReader(IApplicationDbContext context) : ITripReader
             })
             .ToListAsync(cancellationToken);
 
+        var durations = await MeasuredDurationsAsync(
+            accountId, rows.ConvertAll(r => r.Trip.TripId), cancellationToken);
+
         return new TripReportPageVm(
             [.. rows.Select(r => new TripReportRowVm(
                 r.Trip.TripId,
@@ -306,6 +381,11 @@ public sealed class TripReader(IApplicationDbContext context) : ITripReader
                 r.Trip.PlannedEndAt,
                 r.Trip.ActualStartAt,
                 r.Trip.ActualEndAt,
+                r.Trip.OriginArrivedAt,
+                r.Trip.OriginDepartedAt,
+                Minutes(r.Trip.OriginArrivedAt, r.Trip.OriginDepartedAt),
+                TransitMinutes(r.Trip, durations.GetValueOrDefault(r.Trip.TripId)),
+                Minutes(r.Trip.ActualStartAt, r.Trip.ActualEndAt),
                 r.Trip.Notes,
                 r.Trip.LastPositionAt,
                 r.Trip.LastPoint == null ? null : r.Trip.LastPoint.Y,
@@ -385,6 +465,7 @@ public sealed class TripReader(IApplicationDbContext context) : ITripReader
                 r.StopCustomerName ?? r.TripCustomerName,
                 r.Stop.Sequence,
                 r.Stop.Name,
+                r.Stop.Activity,
                 r.Stop.Status,
                 r.Stop.PlannedArrivalFrom,
                 r.Stop.PlannedArrivalTo,
@@ -523,6 +604,70 @@ public sealed class TripReader(IApplicationDbContext context) : ITripReader
             skip + rows.Count < totalCount);
     }
 
+    /// <summary>Whole minutes between two measurements, or null when either was never taken.</summary>
+    private static int? Minutes(DateTimeOffset? from, DateTimeOffset? to)
+        => from is { } start && to is { } end && end >= start
+            ? (int)(end - start).TotalMinutes
+            : null;
+
+    /// <summary>
+    /// Time actually spent moving: from the origin departure to the last measured arrival, less the
+    /// dwell at every stop in between (spec 11a §4.3).
+    /// <para>
+    /// Subtracting the intermediate dwells is what makes the number mean "driving". A five-stop
+    /// delivery run that spent three hours on the road and two at docks would otherwise report five
+    /// hours of transit, and the loading/unloading columns beside it would double-count the same
+    /// two hours.
+    /// </para>
+    /// </summary>
+    private static int? TransitMinutes(Trip trip, (DateTimeOffset? LastArrivalAt, double IntermediateDwellMinutes) measured)
+    {
+        if (trip.OriginDepartedAt is not { } departed || measured.LastArrivalAt is not { } lastArrival)
+        {
+            return null;
+        }
+
+        var gross = (lastArrival - departed).TotalMinutes;
+        return gross <= 0 ? 0 : (int)Math.Max(gross - measured.IntermediateDwellMinutes, 0d);
+    }
+
+    /// <summary>
+    /// The per-trip stop measurements the transit calculation needs, for a whole report page in one
+    /// query — one round trip, not one per row.
+    /// </summary>
+    private async Task<Dictionary<Guid, (DateTimeOffset? LastArrivalAt, double IntermediateDwellMinutes)>> MeasuredDurationsAsync(
+        Guid accountId, IReadOnlyCollection<Guid> tripIds, CancellationToken cancellationToken)
+    {
+        if (tripIds.Count == 0)
+        {
+            return [];
+        }
+
+        var ids = tripIds.ToList();
+        var stops = await context.TripStops
+            .Where(s => ids.Contains(s.TripId) && s.AccountId == accountId && s.ActualArrivalAt != null)
+            .Select(s => new { s.TripId, s.ActualArrivalAt, s.ActualDepartureAt })
+            .ToListAsync(cancellationToken);
+
+        return stops
+            .GroupBy(s => s.TripId)
+            .ToDictionary(
+                g => g.Key,
+                g =>
+                {
+                    var lastArrival = g.Max(s => s.ActualArrivalAt);
+
+                    // "Intermediate" is every visit that CLOSED before the trip's last arrival. The
+                    // final stop's own dwell is not transit time and is reported separately as its
+                    // activity's loading/unloading duration.
+                    var dwell = g
+                        .Where(s => s.ActualDepartureAt.HasValue && s.ActualArrivalAt < lastArrival)
+                        .Sum(s => (s.ActualDepartureAt!.Value - s.ActualArrivalAt!.Value).TotalMinutes);
+
+                    return (lastArrival, dwell);
+                });
+    }
+
     /// <summary>
     /// The shared scope for all four report feeds: the same account boundary, the same group
     /// visibility and the same filters as the list and detail paths (acceptance 3).
@@ -600,13 +745,12 @@ public sealed class TripReader(IApplicationDbContext context) : ITripReader
         }
 
         var tripIds = trips.ConvertAll(t => t.TripId);
-        var counts = await context.TripStops
-            .Where(s => tripIds.Contains(s.TripId))
-            .GroupBy(s => s.TripId)
-            .Select(g => new { TripId = g.Key, Count = g.Count() })
-            .ToListAsync(cancellationToken);
+        var (overdueGraceMinutes, stopsByTrip) = await PhaseContextAsync(trips[0].AccountId, tripIds, cancellationToken);
 
-        var byTrip = counts.ToDictionary(c => c.TripId, c => c.Count);
-        return [.. trips.Select(t => TripMapper.ToVm(t, byTrip.TryGetValue(t.TripId, out var count) ? count : 0))];
+        return [.. trips.Select(t =>
+        {
+            var stops = stopsByTrip.TryGetValue(t.TripId, out var found) ? found : [];
+            return TripMapper.ToVm(t, stops.Count, stops, overdueGraceMinutes);
+        })];
     }
 }

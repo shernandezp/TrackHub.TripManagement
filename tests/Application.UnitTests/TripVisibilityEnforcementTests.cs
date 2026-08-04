@@ -396,9 +396,9 @@ public class TripVisibilityEnforcementTests
     }
 
     private static TripStopDto Stop(Guid? geofenceId)
-        => new("Customer site", null, null, 4.7, -74.0, geofenceId, 150, null, null, false, 0, null);
+        => new("Customer site", null, null, 4.7, -74.0, geofenceId, 150, TripStopActivities.Unload, null, null, false, 0, null);
 
     private static TripDto Trip(Guid? serviceOrderId)
-        => new("TRIP-001", TestFactory.TransporterId, null, serviceOrderId, null, "ACME", "Depot", 4.65, -74.05,
+        => new("TRIP-001", TestFactory.TransporterId, null, serviceOrderId, null, "ACME", "Depot", 4.65, -74.05, null, TripGeometry.DefaultRadiusMeters,
             DateTimeOffset.UtcNow, null, null, null);
 }

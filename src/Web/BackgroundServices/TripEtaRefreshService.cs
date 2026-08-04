@@ -18,14 +18,20 @@ using TrackHub.TripManagement.Application.Trips.Services.Interfaces;
 namespace TrackHub.TripManagement.Web.BackgroundServices;
 
 /// <summary>
-/// Recomputes ETAs for in-progress trips every 5 minutes and raises <c>TripDelayed</c> once per
-/// stop. ETA is driven by elapsed time and fresh positions, not by an inbound request, so it cannot
-/// ride the SyncWorker-driven detection path.
+/// Recomputes ETAs for in-progress trips every 5 minutes, raises <c>TripDelayed</c> once per stop,
+/// and sweeps for trips that are finished but whose tracker went dark. All three are driven by
+/// elapsed time rather than an inbound request, so none of them can ride the SyncWorker-driven
+/// detection path.
 /// <para>
-/// <b>On-work-only recorder (SVD-11):</b> a <c>BackgroundJobRun</c> row is written ONLY when at
-/// least one ETA was actually refreshed. An old row for <c>trip-eta-refresh</c> is therefore the
-/// healthy steady state — a fleet with no trips in progress is not a stuck job — and <c>/status</c>
-/// must render it neutrally rather than as a staleness alarm.
+/// The auto-completion sweep deliberately shares this cycle and this job key instead of adding a
+/// <c>BackgroundJobKeys</c> entry: it is a fallback for a case detection cannot see (no more fixes
+/// are coming), not a schedule of its own (spec 11a §5.2).
+/// </para>
+/// <para>
+/// <b>On-work-only recorder (SVD-11):</b> a <c>BackgroundJobRun</c> row is written ONLY when the
+/// cycle actually did something — refreshed an ETA or closed a trip. An old row for
+/// <c>trip-eta-refresh</c> is therefore the healthy steady state — a fleet with no trips in progress
+/// is not a stuck job — and <c>/status</c> must render it neutrally rather than as a staleness alarm.
 /// </para>
 /// </summary>
 public sealed class TripEtaRefreshService(
@@ -69,10 +75,15 @@ public sealed class TripEtaRefreshService(
         var etaService = scope.ServiceProvider.GetRequiredService<ITripEtaService>();
         var refreshed = await etaService.RefreshEtasAsync(cancellationToken);
 
-        if (refreshed == 0)
+        var autoCompletion = scope.ServiceProvider.GetRequiredService<ITripAutoCompletionService>();
+        var completed = await autoCompletion.SweepAsync(cancellationToken);
+
+        if (refreshed == 0 && completed == 0)
             return;
 
-        logger.LogInformation("Trip ETA refresh updated {Refreshed} stop ETA(s)", refreshed);
+        logger.LogInformation(
+            "Trip ETA refresh updated {Refreshed} stop ETA(s) and auto-completed {Completed} trip(s)",
+            refreshed, completed);
 
         // Recording is best-effort: a Manager outage must not take the job down with it.
         try
@@ -81,7 +92,7 @@ public sealed class TripEtaRefreshService(
             await recorder.RecordAsync(
                 BackgroundJobKeys.TripEtaRefresh,
                 null,
-                refreshed.ToString(),
+                $"{refreshed}/{completed}",
                 $"trip-eta-refresh:{startedAt:yyyyMMddHHmmssfff}",
                 "Succeeded",
                 startedAt,

@@ -18,7 +18,18 @@ namespace TrackHub.TripManagement.Domain.Records;
 /// <summary>
 /// Trip write contract. <c>AccountId</c> is deliberately absent — it is resolved from the caller's
 /// identity, never accepted from the wire (spec 11 acceptance 1).
+/// <para>
+/// The "already in transit" declaration (spec 11a §5.4) deliberately does NOT live here. Backfill
+/// has to read the trip's ROUTE to replay stop visits, and the route does not exist yet at create
+/// time — it is a separate finalizing step (<c>DeclareTripInTransitCommand</c>) that every planning
+/// input calls once its stops have landed.
+/// </para>
 /// </summary>
+/// <param name="OriginGeofenceId">
+/// The account geofence the origin was picked from, when it was — its real shape then becomes the
+/// origin zone instead of a radius buffer.
+/// </param>
+/// <param name="OriginRadiusMeters">Buffer radius for a POI/point origin (50–5000 m).</param>
 public readonly record struct TripDto(
     string Code,
     Guid TransporterId,
@@ -29,6 +40,8 @@ public readonly record struct TripDto(
     string OriginName,
     double OriginLatitude,
     double OriginLongitude,
+    Guid? OriginGeofenceId,
+    int OriginRadiusMeters,
     DateTimeOffset PlannedStartAt,
     DateTimeOffset? PlannedEndAt,
     string? Notes,
@@ -45,6 +58,10 @@ public readonly record struct TripDto(
 /// response (<c>AddressVm</c> already carries a distinct city alongside the full address).
 /// </para>
 /// </summary>
+/// <param name="Activity">
+/// <c>Load</c>, <c>Unload</c> or <c>Other</c>. Anything unrecognised (including empty) normalizes to
+/// <c>Unload</c>, so an older client that does not send the field keeps working.
+/// </param>
 public readonly record struct TripStopDto(
     string Name,
     string? Address,
@@ -53,6 +70,7 @@ public readonly record struct TripStopDto(
     double Longitude,
     Guid? GeofenceId,
     int ArrivalRadiusMeters,
+    string? Activity,
     DateTimeOffset? PlannedArrivalFrom,
     DateTimeOffset? PlannedArrivalTo,
     bool RequiresPod,
@@ -115,6 +133,11 @@ public readonly record struct TransporterPositionDto(
 /// <summary>
 /// Partner/TMS import row. Idempotent on <paramref name="ExternalReference"/>, which is unique
 /// per account — a re-sent batch updates rather than duplicating (spec 11 §7.9).
+/// <para>
+/// Re-sending a still-<c>Created</c> trip REPLACES its stops (spec 11a §9.2). The stops payload used
+/// to be silently dropped on the update path, so a partner's weekly re-upload could revise a trip's
+/// header and never its route — the one thing a re-plan usually changes.
+/// </para>
 /// </summary>
 public readonly record struct TripImportDto(
     string ExternalReference,
@@ -125,8 +148,10 @@ public readonly record struct TripImportDto(
     string OriginName,
     double OriginLatitude,
     double OriginLongitude,
+    Guid? OriginGeofenceId,
     DateTimeOffset PlannedStartAt,
     DateTimeOffset? PlannedEndAt,
+    DateTimeOffset? StartedAt,
     string? Notes,
     IReadOnlyCollection<TripStopDto> Stops);
 

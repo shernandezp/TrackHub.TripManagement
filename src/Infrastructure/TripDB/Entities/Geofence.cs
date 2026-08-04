@@ -18,13 +18,21 @@ using NetTopologySuite.Geometries;
 namespace TrackHub.TripManagement.Infrastructure.TripDB.Entities;
 
 // Read-only projection of the Geofencing-owned geofencing.geofences table, mapped with
-// ExcludeFromMigrations. It is read exactly ONCE per trip - when the trip starts, to snapshot each
-// stop ArrivalGeom (spec 11 section 18.4). A geofence edited mid-trip therefore cannot move a
-// running trip arrival geometry.
+// ExcludeFromMigrations. The geometry is read exactly ONCE per trip - at ARMING, to snapshot the
+// origin zone and every stop's ArrivalGeom (spec 11a section 6.2). A geofence edited afterwards
+// therefore cannot move a watched trip's detection geometry.
+//
+// Name and CircleCenter serve a second, separate purpose: bulk planning resolves places BY NAME
+// (spec 11a section 9.1), because a dispatcher building a week of trips in a spreadsheet types
+// "Plant 3", not a uuid and never a coordinate.
 public sealed class Geofence
 {
     public Guid GeofenceId { get; set; }
     public Guid AccountId { get; set; }
+    public string Name { get; set; } = string.Empty;
     public Polygon Geom { get; set; } = default!;
+
+    /// <summary>Centre of a circle geofence; null for a drawn polygon, whose first vertex stands in.</summary>
+    public Point? CircleCenter { get; set; }
     public bool Active { get; set; }
 }

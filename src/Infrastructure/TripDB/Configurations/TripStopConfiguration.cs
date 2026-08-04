@@ -42,6 +42,8 @@ public sealed class TripStopConfiguration : IEntityTypeConfiguration<TripStop>
             .HasDefaultValue(TripGeometryDefaults.ArrivalRadiusMeters);
         builder.Property(x => x.PlannedArrivalFrom).HasColumnName("plannedarrivalfrom");
         builder.Property(x => x.PlannedArrivalTo).HasColumnName("plannedarrivalto");
+        builder.Property(x => x.Activity).HasColumnName("activity").HasMaxLength(10).IsRequired()
+            .HasDefaultValue(TripStopActivities.Unload);
         builder.Property(x => x.Status).HasColumnName("status").HasMaxLength(40).IsRequired();
         builder.Property(x => x.ActualArrivalAt).HasColumnName("actualarrivalat");
         builder.Property(x => x.ActualDepartureAt).HasColumnName("actualdepartureat");

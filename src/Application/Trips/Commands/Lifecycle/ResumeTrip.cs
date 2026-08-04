@@ -30,7 +30,6 @@ public readonly record struct ResumeTripCommand(Guid TripId) : IRequest;
 public sealed class ResumeTripCommandHandler(
     ITripWriter writer,
     ITripReader reader,
-    ITripEventWriter tripEventWriter,
     IAlertEmitter alertEmitter,
     IUserReader userReader,
     IUser user,
@@ -42,11 +41,13 @@ public sealed class ResumeTripCommandHandler(
     {
         var caller = await userReader.GetUserAsync(UserId, cancellationToken);
         await TripLifecycleTransition.ExecuteAsync(
-            reader, writer, tripEventWriter, alertEmitter, logger,
+            reader, writer, alertEmitter, logger,
             request.TripId, caller.AccountId, TripVisibility.ResolveScopeUserId(user, UserId),
             TripStatuses.InProgress, TripEventTypes.TripResumed, alertSeverity: null,
+            TripEventSources.Portal,
             reason: null, force: false,
             $"trip-resume:{request.TripId:N}:{DateTimeOffset.UtcNow.UtcTicks}",
+            measuredAt: null,
             cancellationToken);
     }
 }
